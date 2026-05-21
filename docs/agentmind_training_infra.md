@@ -29,9 +29,34 @@ agentmind/
 
 ## 1. Data Pipeline
 
+### Training Data Strategy
+
+AgentMind uses a **multi-source data strategy** combining open datasets, curated corpora, and synthetic agent trajectories.
+
+#### Open Datasets (HF Hub)
+| Dataset | Lines | Purpose |
+|---|---|---|
+| FineWeb | 20,001 | General text, reasoning, instruction following |
+| The Stack (Python) | 9,904 | Code structure, JSON, function patterns |
+| UltraChat | 63,086 | Multi-turn dialogue, system prompts |
+| AgentInstruct | ~5,000 | High-quality agent trajectories (THUDM) |
+| ToolBench | ~3,000 | Tool calling patterns |
+| WebArena | ~3,000 | Web navigation agent data |
+
+#### Synthetic Data
+| Source | Samples | Types |
+|---|---|---|
+| `generate_synthetic.py` | 1,703 | instruction, tool_single, agent_multi, recovery |
+| `generate_scaled_synthetic.py` | 11,500 | instruction (3K), tool_single (2.5K), agent_multi (3K), recovery (2K), latent (1K) |
+
+**Total synthetic: 13,203 samples** across 5 types with 14 tools in registry.
+
+#### Special Tokens in Data
+All special tokens (`<|tool_call|>`, `<|observe|>`, `<|plan|>`, `<|scratch|>`, `<|think_start|>`, `<|think_end|>`) are present in both the corpus and synthetic data.
+
 ### `data/formats.py` — JSONL Schema
 
-Every training sample is one of four types. All share the same JSONL line format.
+Every training sample is one of **five** types. All share the same JSONL line format.
 
 ```python
 # TYPE 1 — Plain instruction following
@@ -68,6 +93,15 @@ Every training sample is one of four types. All share the same JSONL line format
     "messages": [
         {"role": "user", "content": "Get stock price of NVDA"},
         {"role": "assistant", "content": "<|tool_call|>{\"name\": \"get_stock\", \"args\": {\"ticker\": \"NVDA\"}}<|observe|>{\"error\": \"rate_limit\", \"retry_after\": 2}<|scratch|>Tool failed. Retry with backoff.<|tool_call|>{\"name\": \"get_stock\", \"args\": {\"ticker\": \"NVDA\", \"source\": \"backup\"}}<|observe|>{\"price\": 1024.5}NVDA is trading at $1024.50."}
+    ]
+}
+
+# TYPE 5 — Latent reasoning (NEW)
+{
+    "type": "latent",
+    "messages": [
+        {"role": "user", "content": "Analyze this carefully before responding."},
+        {"role": "assistant", "content": "<|think_start|>I need to consider the best approach...<|think_end|>Based on careful analysis, here are the results."}
     ]
 }
 ```
@@ -1224,25 +1258,39 @@ def parallel_scan_log(log_coeffs, log_values):
 ## Quick Execution Order
 
 ```bash
-# 1. Generate synthetic data
-python -c "from data.synthetic import generate_dataset; generate_dataset(5000, 'data/synthetic_agents.jsonl')"
+# 1. Build corpus from open datasets (FineWeb, The Stack, UltraChat, AgentInstruct, ToolBench, WebArena)
+python build_corpus.py
 
-# 2. Train tokenizer
+# 2. Generate scaled synthetic data (11.5K template + Cerebras)
+python generate_scaled_synthetic.py
+
+# 3. Train tokenizer on combined corpus
 python -c "from tokenizer_setup import train_tokenizer; train_tokenizer('data/corpus.txt')"
 
-# 3. Train (LoRA, stage 1)
+# 4. Train (LoRA, stage 1)
 python train.py
 
-# 4. Bump to latent stage 2 in train.py TRAIN_CFG, continue training
+# 5. Bump to latent stage 2 in train.py TRAIN_CFG, continue training
 # TRAIN_CFG["latent_stage"] = 2
 python train.py --resume checkpoints/step_03000
 
-# 5. Evaluate
+# 6. Evaluate
 python eval.py --checkpoint checkpoints/step_03000
 
-# 6. Export to 4-bit
+# 7. Export to 4-bit
 python export.py --checkpoint checkpoints/step_03000 --out agentmind-4bit
 
-# 7. Run agent
+# 8. Run agent
 python agent.py --model agentmind-4bit --query "your query"
 ```
+
+### Data Generation Scripts
+
+| Script | Purpose | Output |
+|---|---|---|
+| `build_corpus.py` | Downloads 6 open datasets from HF Hub | `data/corpus.txt` (~250MB) |
+| `generate_synthetic.py` | Initial synthetic data (Cerebras) | `data/synthetic_agents.jsonl` (1.7K) |
+| `generate_scaled_synthetic.py` | Scaled synthetic (templates + Cerebras, rate-limited) | `data/scaled_synthetic.jsonl` (11.5K) |
+
+### Tool Registry (14 tools)
+`web_search`, `read_file`, `write_file`, `run_python`, `get_weather`, `search_arxiv`, `fetch_abstract`, `execute_sql`, `send_email`, `git_commit`, `list_directory`, `get_stock_price`, `translate`, `summarize`

@@ -633,24 +633,35 @@ class AgentLoop:
 ```
 Phase 1 — Format Bedrock          (500 steps)
   Data: instruction pairs, JSON formatting, role adherence
+  Source: FineWeb + UltraChat + 3K instruction synthetic samples
   Goal: model learns token boundaries for all special tokens
 
 Phase 2 — Tool Calling            (800 steps)
   Data: synthetic tool call → observe → answer chains
+  Source: 2.5K tool_single + ToolBench dataset
   Goal: reliable <|tool_call|>{json}<|observe|> formatting
 
 Phase 3 — Multi-step Agents       (1000 steps)
   Data: 3–8 round agentic trajectories with real tool results
+  Source: 3K agent_multi + AgentInstruct + WebArena
   Goal: SSM state carries context across rounds without drift
 
 Phase 4 — Failure Recovery        (700 steps)
   Data: trajectories with injected errors + correct recovery
+  Source: 2K recovery synthetic samples
   Goal: model recovers from bad tool results, retries, admits limits
 
-Phase 4 — Latent Reasoning        (optional, 500 steps)
+Phase 5 — Latent Reasoning        (optional, 500 steps)
   Data: replace some CoT with <|think_start|>...<|think_end|>
+  Source: 1K latent synthetic samples
   Goal: model learns to reason without surfacing tokens
 ```
+
+### Data Sources Summary
+- **Open datasets**: FineWeb (20K), The Stack Python (10K), UltraChat (63K), AgentInstruct (5K), ToolBench (3K), WebArena (3K)
+- **Synthetic**: 13.2K samples across 5 types (instruction, tool_single, agent_multi, recovery, latent)
+- **Tools**: 14 tools in registry with realistic args/results
+- **Total corpus**: ~250MB plain text + 13.2K structured JSONL trajectories
 
 ---
 
@@ -658,7 +669,13 @@ Phase 4 — Latent Reasoning        (optional, 500 steps)
 
 ```bash
 # Install
-pip install mlx mlx-lm sentencepiece datasets
+pip install mlx mlx-lm sentencepiece datasets cerebras-cloud-sdk
+
+# Build corpus from open datasets
+python build_corpus.py
+
+# Generate scaled synthetic data (11.5K samples)
+python generate_scaled_synthetic.py
 
 # Train tokenizer
 python -c "from tokenizer_setup import train_tokenizer; train_tokenizer('data/corpus.txt')"

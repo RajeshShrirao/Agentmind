@@ -74,17 +74,32 @@ class MambaBlock(nn.Module):
         # dB: [B, L, d_inner, d_state]
         dB = dt[:, :, :, None] * B_mat[:, :, None, :]
 
-        # Sequential scan — correct for both train and inference
-        # For training speed: replace with parallel scan using mx.cumsum
-        h = mx.zeros((B, self.d_inner, self.d_state))
-        ys = []
-        for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x[:, t, :, None]
-            y = mx.sum(h * C_mat[:, t, None, :], axis=-1)  # [B, d_inner]
-            ys.append(y)
+        # Parallel scan (log-space for numerical stability)
+        # h_t = dA_t * h_{t-1} + dB_t * x_t
+        # In log space: log_h_t = log(dA_t) + log_h_{t-1} (prefix sum)
+        log_dA = dt[:, :, :, None] * A[None, None]           # [B, L, d_inner, d_state]
+        log_dBx = mx.log(mx.abs(dB * x[:, :, :, None]) + 1e-8)  # [B, L, d_inner, d_state]
 
-        y = mx.stack(ys, axis=1)                   # [B, L, d_inner]
-        return y + x * self.D[None, None, :], h    # output, final state
+        # Prefix sum of log_dA gives cumulative product
+        log_prefix = mx.cumsum(log_dA, axis=1)               # [B, L, d_inner, d_state]
+
+        # Each position's contribution: exp(log_prefix_total - log_prefix_local) * dBx
+        log_prefix_shifted = mx.concatenate([
+            mx.zeros_like(log_prefix[:, :1]),
+            log_prefix[:, :-1]
+        ], axis=1)
+
+        # Compute h via cumulative sum in linear space
+        # h_t = sum_{k=0}^{t} (prod_{j=k+1}^{t} dA_j) * dB_k * x_k
+        # = exp(log_prefix_t) * sum_{k=0}^{t} exp(log_dBx_k - log_prefix_k)
+        log_contrib = log_dBx - log_prefix                   # [B, L, d_inner, d_state]
+        contrib = mx.exp(log_contrib)                        # [B, L, d_inner, d_state]
+        h_cumsum = mx.cumsum(contrib, axis=1)                # [B, L, d_inner, d_state]
+        h = mx.exp(log_prefix) * h_cumsum                    # [B, L, d_inner, d_state]
+
+        # Output: y = sum(h * C) + D * x
+        y = mx.sum(h * C_mat[:, :, None, :], axis=-1)        # [B, L, d_inner]
+        return y + x * self.D[None, None, :], h[:, -1]       # output, final state
 
     def __call__(self, x, h_state=None):
         # x: [B, L, d_model]

@@ -1,19 +1,45 @@
 import json
 import random
 import mlx.core as mx
+import numpy as np
 from pathlib import Path
 from typing import Iterator
 
 class AgentDataset:
-    def __init__(self, paths: list[str], tokenizer, cfg, split="train"):
+    def __init__(self, paths: list[str], tokenizer=None, cfg=None, split="train", pretokenized: bool = False):
         self.cfg = cfg
         self.tok = tokenizer
         self.samples = []
+        self.ids_array = None
+        self.labels_array = None
 
-        for path in paths:
-            with open(path) as f:
-                for line in f:
-                    self.samples.append(json.loads(line.strip()))
+        if pretokenized:
+            # Load pre-tokenized .npz files
+            ids_path = [p for p in paths if "ids" in p]
+            labels_path = [p for p in paths if "labels" in p]
+            if ids_path and labels_path:
+                self.ids_array = np.load(ids_path[0])["arr_0"]
+                self.labels_array = np.load(labels_path[0])["arr_0"]
+                split_idx = int(len(self.ids_array) * 0.95)
+                if split == "train":
+                    self.ids_array = self.ids_array[:split_idx]
+                    self.labels_array = self.labels_array[:split_idx]
+                else:
+                    self.ids_array = self.ids_array[split_idx:]
+                    self.labels_array = self.labels_array[split_idx:]
+        else:
+            # Load raw JSONL files
+            for path in paths:
+                with open(path) as f:
+                    for line in f:
+                        self.samples.append(json.loads(line.strip()))
+
+            random.shuffle(self.samples)
+            split_idx = int(len(self.samples) * 0.95)
+            if split == "train":
+                self.samples = self.samples[:split_idx]
+            else:
+                self.samples = self.samples[split_idx:]
 
         # Data mixing weights by type
         self.weights = {
@@ -62,9 +88,16 @@ class AgentDataset:
         return labels
 
     def __len__(self):
+        if self.ids_array is not None:
+            return len(self.ids_array)
         return len(self.samples)
 
     def __getitem__(self, idx):
+        if self.ids_array is not None:
+            ids = self.ids_array[idx].tolist()
+            labels = self.labels_array[idx].tolist()
+            return ids, labels
+
         sample = self.samples[idx]
         text = self._format_sample(sample)
         ids = self._tokenize(text)

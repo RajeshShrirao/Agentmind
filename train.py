@@ -28,7 +28,7 @@ TRAIN_CFG = dict(
     seq_len       = 2048,
     lora_rank     = 16,
     lora_alpha    = 32.0,
-    eval_every    = 50,
+    eval_every    = 500,     # Increased from 50 to avoid eval bottleneck
     save_every    = 200,
     save_dir      = "./checkpoints",
     use_mtp       = True,
@@ -71,7 +71,10 @@ def make_train_step(model):
                 return main + aux
             return main
 
-        loss, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
+        # Filter out non-parameter attributes (last_hidden, last_mtp_logits)
+        trainable = {k: v for k, v in model.trainable_parameters().items()
+                     if not k.startswith("last_")}
+        loss, grads = mx.value_and_grad(loss_fn)(trainable)
         return loss, grads
 
     return train_step
@@ -108,23 +111,36 @@ def train():
     from tokenizer_setup import load_tokenizer
     tok = load_tokenizer("agentmind_tok.model")
 
-    # Use scaled synthetic data + any instruction data if available
-    data_files = ["data/scaled_synthetic.jsonl"]
-    if os.path.exists("data/instructions.jsonl"):
-        data_files.append("data/instructions.jsonl")
-    if os.path.exists("data/synthetic_agents.jsonl"):
-        data_files.append("data/synthetic_agents.jsonl")
+    # Use pre-tokenized data if available, otherwise use raw JSONL
+    if os.path.exists("data/train_ids.npz") and os.path.exists("data/train_labels.npz"):
+        train_ds = AgentDataset(
+            ["data/train_ids.npz", "data/train_labels.npz"],
+            cfg=cfg, split="train", pretokenized=True
+        )
+        val_ds = AgentDataset(
+            ["data/val_ids.npz", "data/val_labels.npz"],
+            cfg=cfg, split="val", pretokenized=True
+        )
+        print("Loaded pre-tokenized dataset")
+    else:
+        # Use scaled synthetic data + any instruction data if available
+        data_files = ["data/scaled_synthetic.jsonl"]
+        if os.path.exists("data/instructions.jsonl"):
+            data_files.append("data/instructions.jsonl")
+        if os.path.exists("data/synthetic_agents.jsonl"):
+            data_files.append("data/synthetic_agents.jsonl")
 
-    train_ds = AgentDataset(
-        data_files,
-        tokenizer=tok, cfg=cfg, split="train"
-    )
-    val_ds = AgentDataset(
-        data_files,
-        tokenizer=tok, cfg=cfg, split="val"
-    )
+        train_ds = AgentDataset(
+            data_files,
+            tokenizer=tok, cfg=cfg, split="train"
+        )
+        val_ds = AgentDataset(
+            data_files,
+            tokenizer=tok, cfg=cfg, split="val"
+        )
+        print(f"Loaded raw dataset from {len(data_files)} files")
 
-    train_step_fn = make_train_step(model)
+    train_step_fn = mx.compile(make_train_step(model))
     step = 0
     accum_loss = 0.0
     accum_grad = None
@@ -133,6 +149,7 @@ def train():
     model.train()
     print(f"Training AgentMind | {sum(p.size for _,p in tree_flatten(model.trainable_parameters())):,} trainable params")
 
+    t0 = time.time()  # Track time across entire grad_accum window
     while step < TRAIN_CFG["total_steps"]:
         loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"], max_len=TRAIN_CFG["seq_len"])
 
@@ -140,7 +157,6 @@ def train():
             if step >= TRAIN_CFG["total_steps"]:
                 break
 
-            t0 = time.time()
             loss, grads = train_step_fn(input_ids, targets)
             mx.eval(loss, grads)
 
@@ -156,17 +172,23 @@ def train():
             if (step + 1) % TRAIN_CFG["grad_accum"] == 0:
                 # Average accumulated gradients
                 accum_grad = tree_map(lambda g: g / TRAIN_CFG["grad_accum"], accum_grad)
-                optimizer.update(model, accum_grad)
+                # Only update actual trainable parameters (exclude last_hidden, last_mtp_logits)
+                trainable = {k: v for k, v in model.trainable_parameters().items()
+                             if not k.startswith("last_")}
+                optimizer.update(trainable, accum_grad)
                 mx.eval(model.parameters(), optimizer.state)
                 lr = scheduler.step()
                 accum_grad = None
 
+                elapsed = time.time() - t0
                 avg_loss = accum_loss / TRAIN_CFG["grad_accum"]
                 accum_loss = 0.0
-                tok_per_sec = (input_ids.shape[1] * TRAIN_CFG["grad_accum"]) / (time.time() - t0)
+                tok_per_sec = (input_ids.shape[1] * TRAIN_CFG["grad_accum"]) / elapsed
 
                 print(f"step {step:4d} | loss {avg_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.3f} | {tok_per_sec:.0f} tok/s")
                 log.append({"step": step, "loss": avg_loss, "lr": lr})
+
+                t0 = time.time()  # Reset timer for next window
 
             # Eval
             if step % TRAIN_CFG["eval_every"] == 0 and step > 0:

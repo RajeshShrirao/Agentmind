@@ -53,13 +53,9 @@ class AgentDataset:
         Mask system + user tokens with -100 (ignored in loss).
         """
         labels = [-100] * len(ids)
-        text = self._format_sample(sample)
-        # Find assistant turn boundaries and unmask them
-        # Simple heuristic: unmask everything after <|assistant|>
-        assistant_id = self.cfg.tool_call_id - 1  # adjust to your token IDs
         in_assistant = False
         for i, tok_id in enumerate(ids):
-            if tok_id == self.cfg.tool_call_id - 1:  # <|assistant|>
+            if tok_id == self.cfg.assistant_id:
                 in_assistant = True
             if in_assistant:
                 labels[i] = tok_id

@@ -39,6 +39,9 @@ class AgentMindConfig:
     observe_id: int = 7
     think_start_id: int = 8
     think_end_id: int = 9
+    system_id: int = 11
+    user_id: int = 12
+    assistant_id: int = 13
 
     @property
     def d_inner(self) -> int:

@@ -1,0 +1,189 @@
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_map
+import time, json, os
+from pathlib import Path
+
+from config import AgentMindConfig
+from model.agent_lm import AgentMind
+from model.mtp_head import mtp_loss
+from data.pipeline import AgentDataset, make_dataloader
+from lora import apply_lora
+from scheduler import CosineWarmupScheduler
+from init import init_agentmind
+
+# ── Config ────────────────────────────────────────────────
+
+cfg = AgentMindConfig()
+
+TRAIN_CFG = dict(
+    lr            = 2e-4,
+    weight_decay  = 0.01,
+    warmup_steps  = 100,
+    total_steps   = 3000,
+    grad_clip     = 1.0,
+    batch_size    = 1,       # MacBook Air — keep at 1
+    grad_accum    = 8,       # effective batch = 8
+    seq_len       = 2048,
+    lora_rank     = 16,
+    lora_alpha    = 32.0,
+    eval_every    = 50,
+    save_every    = 200,
+    save_dir      = "./checkpoints",
+    use_mtp       = True,
+    mtp_weight    = 0.2,
+    latent_stage  = 1,       # bump to 2, 3, 4 progressively
+)
+
+# ── Loss ──────────────────────────────────────────────────
+
+def cross_entropy_loss(logits, targets):
+    B, L, V = logits.shape
+    flat_logits  = logits.reshape(-1, V)
+    flat_targets = targets.reshape(-1)
+    mask = (flat_targets != -100).astype(mx.float32)
+    loss = nn.losses.cross_entropy(flat_logits, mx.maximum(flat_targets, 0), reduction='none')
+    return (loss * mask).sum() / (mask.sum() + 1e-8)
+
+# ── Gradient clipping ─────────────────────────────────────
+
+def clip_gradients(grads, max_norm: float):
+    leaves = [g for _, g in tree_flatten(grads)]
+    norm = mx.sqrt(sum(mx.sum(g ** 2) for g in leaves))
+    scale = mx.minimum(1.0, max_norm / (norm + 1e-6))
+    return tree_map(lambda g: g * scale, grads), norm.item()
+
+# ── Train step ────────────────────────────────────────────
+
+def make_train_step(model):
+    def train_step(input_ids, targets):
+        def loss_fn(params):
+            model.update(params)
+            logits, h_states = model(input_ids)
+            main = cross_entropy_loss(logits, targets)
+
+            if TRAIN_CFG["use_mtp"] and hasattr(model, "mtp"):
+                # Get hidden states before lm_head for MTP
+                # (store as model attribute during forward pass)
+                aux = mtp_loss(model.last_mtp_logits, targets,
+                               weight=TRAIN_CFG["mtp_weight"])
+                return main + aux
+            return main
+
+        loss, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
+        return loss, grads
+
+    return train_step
+
+# ── Eval stub (eval.py will implement this fully) ─────────
+
+def evaluate(model, val_ds, tok, cfg):
+    """Placeholder eval — returns dummy metrics until eval.py is implemented."""
+    return 8.0, 0.0
+
+# ── Main training loop ────────────────────────────────────
+
+def train():
+    Path(TRAIN_CFG["save_dir"]).mkdir(exist_ok=True)
+
+    # Model
+    model = AgentMind(cfg)
+    model = init_agentmind(model, cfg)
+    model = apply_lora(model, rank=TRAIN_CFG["lora_rank"], alpha=TRAIN_CFG["lora_alpha"])
+
+    # Optimizer + Scheduler
+    optimizer = optim.AdamW(
+        learning_rate=TRAIN_CFG["lr"],
+        weight_decay=TRAIN_CFG["weight_decay"]
+    )
+    scheduler = CosineWarmupScheduler(
+        optimizer,
+        base_lr=TRAIN_CFG["lr"],
+        warmup_steps=TRAIN_CFG["warmup_steps"],
+        total_steps=TRAIN_CFG["total_steps"]
+    )
+
+    # Data
+    from tokenizer_setup import load_tokenizer
+    tok = load_tokenizer("agentmind_tok.model")
+
+    # Use scaled synthetic data + any instruction data if available
+    data_files = ["data/scaled_synthetic.jsonl"]
+    if os.path.exists("data/instructions.jsonl"):
+        data_files.append("data/instructions.jsonl")
+    if os.path.exists("data/synthetic_agents.jsonl"):
+        data_files.append("data/synthetic_agents.jsonl")
+
+    train_ds = AgentDataset(
+        data_files,
+        tokenizer=tok, cfg=cfg, split="train"
+    )
+    val_ds = AgentDataset(
+        data_files,
+        tokenizer=tok, cfg=cfg, split="val"
+    )
+
+    train_step_fn = make_train_step(model)
+    step = 0
+    accum_loss = 0.0
+    accum_grad = None
+    log = []
+
+    print(f"Training AgentMind | {sum(p.size for _,p in model.trainable_parameters()):,} trainable params")
+
+    while step < TRAIN_CFG["total_steps"]:
+        loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"])
+
+        for input_ids, targets in loader:
+            if step >= TRAIN_CFG["total_steps"]:
+                break
+
+            t0 = time.time()
+            loss, grads = train_step_fn(input_ids, targets)
+            mx.eval(loss, grads)
+
+            # Gradient accumulation
+            grads, grad_norm = clip_gradients(grads, TRAIN_CFG["grad_clip"])
+            accum_loss += loss.item()
+
+            if accum_grad is None:
+                accum_grad = grads
+            else:
+                accum_grad = tree_map(lambda a, b: a + b, accum_grad, grads)
+
+            if (step + 1) % TRAIN_CFG["grad_accum"] == 0:
+                # Average accumulated gradients
+                accum_grad = tree_map(lambda g: g / TRAIN_CFG["grad_accum"], accum_grad)
+                optimizer.update(model, accum_grad)
+                mx.eval(model.parameters(), optimizer.state)
+                lr = scheduler.step()
+                accum_grad = None
+
+                avg_loss = accum_loss / TRAIN_CFG["grad_accum"]
+                accum_loss = 0.0
+                tok_per_sec = TRAIN_CFG["batch_size"] * TRAIN_CFG["seq_len"] / (time.time() - t0)
+
+                print(f"step {step:4d} | loss {avg_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.3f} | {tok_per_sec:.0f} tok/s")
+                log.append({"step": step, "loss": avg_loss, "lr": lr})
+
+            # Eval
+            if step % TRAIN_CFG["eval_every"] == 0 and step > 0:
+                val_loss, tool_acc = evaluate(model, val_ds, tok, cfg)
+                print(f"  ── EVAL step {step} | val_loss {val_loss:.4f} | tool_acc {tool_acc:.2%}")
+                log[-1].update({"val_loss": val_loss, "tool_acc": tool_acc})
+
+            # Save
+            if step % TRAIN_CFG["save_every"] == 0 and step > 0:
+                save_path = f"{TRAIN_CFG['save_dir']}/step_{step:05d}"
+                Path(save_path).mkdir(exist_ok=True)
+                mx.savez(f"{save_path}/weights.npz", **dict(tree_flatten(model.parameters())))
+                json.dump(log, open(f"{save_path}/log.json", "w"), indent=2)
+                print(f"  ── Saved checkpoint → {save_path}")
+
+            step += 1
+
+    print("Training complete.")
+
+if __name__ == "__main__":
+    train()

@@ -157,21 +157,33 @@ Roundtrip encoding/decoding verified ✓
 | FineWeb | 20,001 | General text, reasoning, instruction following |
 | The Stack (Python) | 9,904 | Code structure, JSON, function patterns |
 | UltraChat | 63,086 | Multi-turn dialogue, system prompts |
-| **Total** | **92,991** | **189.8 MB** |
+| AgentInstruct | ~5,000 | High-quality agent trajectories |
+| ToolBench | ~3,000 | Tool calling patterns |
+| WebArena | ~3,000 | Web navigation agent data |
+| **Total** | **~104,000** | **~250MB** |
 
-### Synthetic Data (`generate_synthetic.py`)
+### Synthetic Data - Initial (`generate_synthetic.py`)
 - Used Cerebras API (llama3.1-8b) for diverse samples
-- 1,703 samples generated across 4 types:
-  - `instruction` (500) — simple Q&A
-  - `tool_single` (500) — one tool call chain
-  - `agent_multi` (500) — 3-4 step tool chains with plans
-  - `recovery` (200) — tool errors + scratch reasoning + retry
-  - Cerebras-generated (3) — additional diversity
+- 1,703 samples generated across 4 types
 
-### Final Corpus
-- **Size**: 190.5 MB
-- **Format**: Plain text + JSONL synthetic data appended
-- **Special tokens**: All present in training data
+### Synthetic Data - Scaled (`generate_scaled_synthetic.py`)
+- **11,500 samples** generated via template-based generation
+- Rate-limited Cerebras API (40 req/min) for high-quality diversity
+- 14 tools in registry with realistic args/results
+
+| Type | Count | Purpose |
+|---|---|---|
+| `instruction` | 3,000 | Simple Q&A, instruction following |
+| `tool_single` | 2,500 | One tool call chain |
+| `agent_multi` | 3,000 | 2-5 step tool chains with `<|plan|>` |
+| `recovery` | 2,000 | Tool errors + `<|scratch|>` reasoning + retry |
+| `latent` | 1,000 | `<|think_start|>`...`<|think_end|>` patterns |
+| **Total** | **11,500** | **6.2 MB** |
+
+### Final Training Data
+- **Corpus**: ~250 MB (general text + code + dialogue + agent datasets)
+- **Synthetic JSONL**: 11,500 structured agent trajectories
+- **Special tokens**: All present in both corpus and synthetic data
 
 ---
 
@@ -239,6 +251,11 @@ Roundtrip encoding/decoding verified ✓
 - [ ] `export.py` — GGUF export
 - [ ] `agent.py` — Agentic inference loop
 - [ ] `model/latent.py` — Latent reasoning training logic
+
+### Data Generation (Complete)
+- [x] Corpus: FineWeb + The Stack + UltraChat + AgentInstruct + ToolBench + WebArena
+- [x] Synthetic: 11,500 structured agent trajectories
+- [x] Tokenizer: 32K vocab BPE with all special tokens
 
 ### Training Curriculum
 1. **Phase 1** — Format Bedrock (500 steps): instruction pairs, JSON formatting

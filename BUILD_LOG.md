@@ -162,10 +162,6 @@ Roundtrip encoding/decoding verified ✓
 | WebArena | ~3,000 | Web navigation agent data |
 | **Total** | **~104,000** | **~250MB** |
 
-### Synthetic Data - Initial (`generate_synthetic.py`)
-- Used Cerebras API (llama3.1-8b) for diverse samples
-- 1,703 samples generated across 4 types
-
 ### Synthetic Data - Scaled (`generate_scaled_synthetic.py`)
 - **11,500 samples** generated via template-based generation
 - Rate-limited Cerebras API (40 req/min) for high-quality diversity
@@ -228,12 +224,19 @@ Roundtrip encoding/decoding verified ✓
 | `model/agent_lm.py` | ✅ Complete | AgentMind with MTP integration |
 | `model/mtp_head.py` | ✅ Complete | MTPHead + mtp_loss |
 | `model/conv_state.py` | ✅ Complete | ConvState for inference |
+| `model/latent.py` | ✅ Complete | Latent reasoning training logic |
 | `init.py` | ✅ Complete | Mamba-specific weight init |
 | `tokenizer_setup.py` | ✅ Complete | SentencePiece training + loading |
 | `build_corpus.py` | ✅ Complete | Multi-source corpus builder |
 | `generate_synthetic.py` | ✅ Complete | Cerebras-powered synthetic data |
-| `data/corpus.txt` | ✅ Built | 190.5 MB training corpus |
-| `data/synthetic_agents.jsonl` | ✅ Built | 1,703 synthetic samples |
+| `generate_scaled_synthetic.py` | ✅ Complete | 11.5K samples with rate limiting |
+| `data/formats.py` | ✅ Complete | JSONL schemas + validate_sample() |
+| `data/synthetic.py` | ✅ Complete | 14 tools, trajectory generators |
+| `data/pipeline.py` | ✅ Complete | AgentDataset, collate_batch, make_dataloader |
+| `lora.py` | ✅ Complete | LoRALinear + apply_lora (66M trainable params) |
+| `scheduler.py` | ✅ Complete | CosineWarmupScheduler |
+| `data/corpus.txt` | ✅ Built | ~250 MB training corpus |
+| `data/scaled_synthetic.jsonl` | ✅ Built | 11,500 synthetic samples |
 | `agentmind_tok.model` | ✅ Trained | 32K vocab BPE tokenizer |
 | `agentmind_tok.vocab` | ✅ Generated | Vocabulary file |
 
@@ -242,15 +245,10 @@ Roundtrip encoding/decoding verified ✓
 ## Remaining Work
 
 ### Training Infrastructure (Not Yet Implemented)
-- [ ] `data/pipeline.py` — AgentDataset, collate_batch, make_dataloader
-- [ ] `data/formats.py` — JSONL schema definitions
-- [ ] `lora.py` — LoRALinear + apply_lora
-- [ ] `scheduler.py` — CosineWarmupScheduler
 - [ ] `train.py` — Complete training loop with gradient accumulation
 - [ ] `eval.py` — Perplexity + tool call accuracy
 - [ ] `export.py` — GGUF export
 - [ ] `agent.py` — Agentic inference loop
-- [ ] `model/latent.py` — Latent reasoning training logic
 
 ### Data Generation (Complete)
 - [x] Corpus: FineWeb + The Stack + UltraChat + AgentInstruct + ToolBench + WebArena
@@ -269,7 +267,7 @@ Roundtrip encoding/decoding verified ✓
 ## Quick Start (Next Steps)
 
 ```bash
-# 1. Implement remaining files (pipeline, lora, scheduler, train, eval, export, agent)
+# 1. Implement remaining files (train, eval, export, agent)
 # 2. Run training
 python train.py
 

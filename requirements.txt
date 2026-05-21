@@ -1,0 +1,9 @@
+mlx
+mlx-lm
+sentencepiece
+datasets
+orjson
+msgspec
+transformers
+tqdm
+numpy

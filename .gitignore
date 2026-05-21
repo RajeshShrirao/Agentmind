@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# MLX / Model weights
+*.safetensors
+*.npz
+*.gguf
+*.bin
+*.ckpt
+checkpoints/
+agentmind-4bit/
+*_hf/
+
+# Tokenizer outputs (keep model files, ignore intermediates)
+*.vocab
+*.model
+agentmind_tok.*
+
+# Data (large files, regenerate or store elsewhere)
+data/corpus.txt
+data/*.jsonl
+data/*.parquet
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# HF cache
+.cache/
+huggingface/

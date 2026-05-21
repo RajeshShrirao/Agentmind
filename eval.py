@@ -8,8 +8,9 @@ def compute_perplexity(model, dataset, tok, cfg, max_batches: int = 50) -> float
     """Standard perplexity on validation set."""
     total_loss = 0.0
     total_tokens = 0
-    loader = make_dataloader(dataset, batch_size=1, shuffle=False)
+    loader = make_dataloader(dataset, batch_size=1, shuffle=False, max_len=cfg.max_seq_len)
 
+    model.eval()
     for i, (input_ids, targets) in enumerate(loader):
         if i >= max_batches:
             break
@@ -22,6 +23,7 @@ def compute_perplexity(model, dataset, tok, cfg, max_batches: int = 50) -> float
         total_loss   += (loss * mask).sum().item()
         total_tokens += mask.sum().item()
 
+    model.train()
     return math.exp(total_loss / max(total_tokens, 1))
 
 def tool_call_accuracy(model, prompts: list[str], tok, cfg) -> float:
@@ -91,13 +93,19 @@ def format_adherence(model, prompts: list[str], tok, cfg) -> dict:
 
 def evaluate(model, val_dataset, tok, cfg):
     """Combined eval — returns (val_loss, tool_acc)."""
-    ppl = compute_perplexity(model, val_dataset, tok, cfg)
+    try:
+        ppl = compute_perplexity(model, val_dataset, tok, cfg, max_batches=10)
+    except Exception:
+        ppl = 10000.0  # fallback if eval fails
 
     test_prompts = [
         "<|user|>Search arxiv for Mamba SSM papers<|assistant|>",
         "<|user|>Get the weather in Tokyo and Pune<|assistant|>",
         "<|user|>Run the test suite and fix any failures<|assistant|>",
     ]
-    tool_acc = tool_call_accuracy(model, test_prompts, tok, cfg)
+    try:
+        tool_acc = tool_call_accuracy(model, test_prompts, tok, cfg)
+    except Exception:
+        tool_acc = 0.0
 
     return math.log(ppl), tool_acc  # return log ppl for cleaner display

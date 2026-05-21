@@ -75,20 +75,19 @@ class AgentDataset:
 
         return ids, labels
 
-def collate_batch(samples: list, pad_id: int = 0) -> tuple:
-    """Pad a list of (ids, labels) to same length."""
+def collate_batch(samples: list, pad_id: int = 0, max_len: int = 2048) -> tuple:
+    """Pad a list of (ids, labels) to fixed max_len for consistent gradient shapes."""
     ids_list, labels_list = zip(*samples)
-    max_len = max(len(x) for x in ids_list)
 
-    ids_padded    = [x + [pad_id]  * (max_len - len(x)) for x in ids_list]
-    labels_padded = [x + [-100]    * (max_len - len(x)) for x in labels_list]
+    ids_padded    = [x[:max_len] + [pad_id]  * (max_len - min(len(x), max_len)) for x in ids_list]
+    labels_padded = [x[:max_len] + [-100]    * (max_len - min(len(x), max_len)) for x in labels_list]
 
     return (
         mx.array(ids_padded),
         mx.array(labels_padded)
     )
 
-def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True) -> Iterator:
+def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True, max_len: int = 2048) -> Iterator:
     indices = list(range(len(dataset)))
     if shuffle:
         random.shuffle(indices)
@@ -96,4 +95,4 @@ def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True
     for start in range(0, len(indices), batch_size):
         batch_idx = indices[start:start + batch_size]
         batch = [dataset[i] for i in batch_idx]
-        yield collate_batch(batch)
+        yield collate_batch(batch, max_len=max_len)

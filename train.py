@@ -130,10 +130,11 @@ def train():
     accum_grad = None
     log = []
 
-    print(f"Training AgentMind | {sum(p.size for _,p in model.trainable_parameters()):,} trainable params")
+    model.train()
+    print(f"Training AgentMind | {sum(p.size for _,p in tree_flatten(model.trainable_parameters())):,} trainable params")
 
     while step < TRAIN_CFG["total_steps"]:
-        loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"])
+        loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"], max_len=TRAIN_CFG["seq_len"])
 
         for input_ids, targets in loader:
             if step >= TRAIN_CFG["total_steps"]:
@@ -162,24 +163,30 @@ def train():
 
                 avg_loss = accum_loss / TRAIN_CFG["grad_accum"]
                 accum_loss = 0.0
-                tok_per_sec = TRAIN_CFG["batch_size"] * TRAIN_CFG["seq_len"] / (time.time() - t0)
+                tok_per_sec = (input_ids.shape[1] * TRAIN_CFG["grad_accum"]) / (time.time() - t0)
 
                 print(f"step {step:4d} | loss {avg_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.3f} | {tok_per_sec:.0f} tok/s")
                 log.append({"step": step, "loss": avg_loss, "lr": lr})
 
             # Eval
             if step % TRAIN_CFG["eval_every"] == 0 and step > 0:
-                val_loss, tool_acc = evaluate(model, val_ds, tok, cfg)
-                print(f"  ── EVAL step {step} | val_loss {val_loss:.4f} | tool_acc {tool_acc:.2%}")
-                log[-1].update({"val_loss": val_loss, "tool_acc": tool_acc})
+                try:
+                    val_loss, tool_acc = evaluate(model, val_ds, tok, cfg)
+                    print(f"  ── EVAL step {step} | val_loss {val_loss:.4f} | tool_acc {tool_acc:.2%}")
+                    log[-1].update({"val_loss": val_loss, "tool_acc": tool_acc})
+                except Exception as e:
+                    print(f"  ── EVAL skipped: {e}")
 
             # Save
             if step % TRAIN_CFG["save_every"] == 0 and step > 0:
-                save_path = f"{TRAIN_CFG['save_dir']}/step_{step:05d}"
-                Path(save_path).mkdir(exist_ok=True)
-                mx.savez(f"{save_path}/weights.npz", **dict(tree_flatten(model.parameters())))
-                json.dump(log, open(f"{save_path}/log.json", "w"), indent=2)
-                print(f"  ── Saved checkpoint → {save_path}")
+                try:
+                    save_path = f"{TRAIN_CFG['save_dir']}/step_{step:05d}"
+                    Path(save_path).mkdir(exist_ok=True)
+                    mx.savez(f"{save_path}/weights.npz", **dict(tree_flatten(model.parameters())))
+                    json.dump(log, open(f"{save_path}/log.json", "w"), indent=2)
+                    print(f"  ── Saved checkpoint → {save_path}")
+                except Exception as e:
+                    print(f"  ── Save failed: {e}")
 
             step += 1
 

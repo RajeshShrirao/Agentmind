@@ -217,7 +217,7 @@ Roundtrip encoding/decoding verified ✓
 
 | File | Status | Description |
 |---|---|---|
-| `config.py` | ✅ Complete | AgentMindConfig with all properties |
+| `config.py` | ✅ Complete | AgentMindConfig with all properties + special token IDs |
 | `model/rope.py` | ✅ Complete | RoPE precompute and apply |
 | `model/mamba_block.py` | ✅ Complete | Full MambaBlock with step() |
 | `model/attention_block.py` | ✅ Complete | LocalAttentionBlock with RoPE |
@@ -227,7 +227,7 @@ Roundtrip encoding/decoding verified ✓
 | `model/latent.py` | ✅ Complete | Latent reasoning training logic |
 | `init.py` | ✅ Complete | Mamba-specific weight init |
 | `tokenizer_setup.py` | ✅ Complete | SentencePiece training + loading |
-| `build_corpus.py` | ✅ Complete | Multi-source corpus builder |
+| `build_corpus.py` | ✅ Complete | Multi-source corpus builder (6 datasets) |
 | `generate_synthetic.py` | ✅ Complete | Cerebras-powered synthetic data |
 | `generate_scaled_synthetic.py` | ✅ Complete | 11.5K samples with rate limiting |
 | `data/formats.py` | ✅ Complete | JSONL schemas + validate_sample() |
@@ -235,9 +235,11 @@ Roundtrip encoding/decoding verified ✓
 | `data/pipeline.py` | ✅ Complete | AgentDataset, collate_batch, make_dataloader |
 | `lora.py` | ✅ Complete | LoRALinear + apply_lora (66M trainable params) |
 | `scheduler.py` | ✅ Complete | CosineWarmupScheduler |
-| `data/corpus.txt` | ✅ Built | ~250 MB training corpus |
-| `data/scaled_synthetic.jsonl` | ✅ Built | 11,500 synthetic samples |
-| `agentmind_tok.model` | ✅ Trained | 32K vocab BPE tokenizer |
+| `train.py` | ✅ Complete | Full training loop with grad accumulation, clipping, MTP |
+| `eval.py` | ✅ Complete | Perplexity, tool_call_accuracy, format_adherence |
+| `data/corpus.txt` | ✅ Built | 199.7 MB training corpus |
+| `data/scaled_synthetic.jsonl` | ✅ Built | 11,500 synthetic samples (6.5MB) |
+| `agentmind_tok.model` | ✅ Trained | 32K vocab BPE tokenizer (0.8MB) |
 | `agentmind_tok.vocab` | ✅ Generated | Vocabulary file |
 
 ---
@@ -245,15 +247,19 @@ Roundtrip encoding/decoding verified ✓
 ## Remaining Work
 
 ### Training Infrastructure (Not Yet Implemented)
-- [ ] `train.py` — Complete training loop with gradient accumulation
-- [ ] `eval.py` — Perplexity + tool call accuracy
-- [ ] `export.py` — GGUF export
-- [ ] `agent.py` — Agentic inference loop
+- [ ] `export.py` — GGUF export with custom arch map
+- [ ] `agent.py` — Agentic inference loop with real tools
 
-### Data Generation (Complete)
-- [x] Corpus: FineWeb + The Stack + UltraChat + AgentInstruct + ToolBench + WebArena
-- [x] Synthetic: 11,500 structured agent trajectories
-- [x] Tokenizer: 32K vocab BPE with all special tokens
+### Pre-Training Verification (23/23 Passed ✅)
+- [x] All model components implemented and smoke-tested
+- [x] All training infrastructure implemented
+- [x] Data pipeline loads 10,925 samples correctly
+- [x] Label masking works: system/user masked (-100), assistant unmasked
+- [x] Forward pass produces correct logits shape
+- [x] Loss computation works (10.35 for untrained model)
+- [x] All imports verified
+- [x] Tokenizer trained with all 13 special tokens
+- [x] LoRA applied: 66M trainable params (7.7% of total)
 
 ### Training Curriculum
 1. **Phase 1** — Format Bedrock (500 steps): instruction pairs, JSON formatting
@@ -264,19 +270,14 @@ Roundtrip encoding/decoding verified ✓
 
 ---
 
-## Quick Start (Next Steps)
+## Quick Start
 
 ```bash
-# 1. Implement remaining files (train, eval, export, agent)
-# 2. Run training
+# Everything is ready for training
 python train.py
 
-# 3. Evaluate
+# After training completes:
 python eval.py --checkpoint checkpoints/step_03000
-
-# 4. Export to 4-bit
 python export.py --checkpoint checkpoints/step_03000 --out agentmind-4bit
-
-# 5. Run agent
 python agent.py --model agentmind-4bit --query "your query"
 ```

@@ -120,8 +120,9 @@ def collate_batch(samples: list, pad_id: int = 0, max_len: int = 2048) -> tuple:
         mx.array(labels_padded)
     )
 
-def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True, max_len: int = 2048) -> Iterator:
-    indices = list(range(len(dataset)))
+def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True, max_len: int = 2048, indices: list = None) -> Iterator:
+    if indices is None:
+        indices = list(range(len(dataset)))
     if shuffle:
         random.shuffle(indices)
 

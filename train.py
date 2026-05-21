@@ -23,8 +23,8 @@ TRAIN_CFG = dict(
     warmup_steps  = 100,
     total_steps   = 3000,
     grad_clip     = 1.0,
-    batch_size    = 1,       # MacBook Air — keep at 1
-    grad_accum    = 8,       # effective batch = 8
+    batch_size    = 2,       # Increased from 1 for fewer forward passes
+    grad_accum    = 4,       # Reduced from 8 (effective batch still = 8)
     seq_len       = 2048,
     lora_rank     = 16,
     lora_alpha    = 32.0,
@@ -33,7 +33,10 @@ TRAIN_CFG = dict(
     save_dir      = "./checkpoints",
     use_mtp       = True,
     mtp_weight    = 0.2,
+    mtp_start     = 500,     # Enable MTP only after format learning
     latent_stage  = 1,       # bump to 2, 3, 4 progressively
+    # Sequence length curriculum: step → max_seq_len
+    seq_len_schedule = {0: 512, 500: 1024, 1500: 2048},
 )
 
 # ── Loss ──────────────────────────────────────────────────
@@ -56,6 +59,15 @@ def clip_gradients(grads, max_norm: float):
 
 # ── Train step ────────────────────────────────────────────
 
+def get_current_seq_len(step: int) -> int:
+    """Get sequence length for current step based on curriculum schedule."""
+    schedule = TRAIN_CFG["seq_len_schedule"]
+    current_len = TRAIN_CFG["seq_len"]
+    for threshold, length in sorted(schedule.items()):
+        if step >= threshold:
+            current_len = length
+    return current_len
+
 def make_train_step(model):
     def train_step(input_ids, targets):
         def loss_fn(params):
@@ -63,9 +75,8 @@ def make_train_step(model):
             logits, h_states = model(input_ids)
             main = cross_entropy_loss(logits, targets)
 
+            # Lazy MTP: enable only after mtp_start steps
             if TRAIN_CFG["use_mtp"] and hasattr(model, "mtp"):
-                # Get hidden states before lm_head for MTP
-                # (store as model attribute during forward pass)
                 aux = mtp_loss(model.last_mtp_logits, targets,
                                weight=TRAIN_CFG["mtp_weight"])
                 return main + aux
@@ -148,10 +159,23 @@ def train():
 
     model.train()
     print(f"Training AgentMind | {sum(p.size for _,p in tree_flatten(model.trainable_parameters())):,} trainable params")
+    print(f"Sequence curriculum: {TRAIN_CFG['seq_len_schedule']}")
+    print(f"Lazy MTP: enabled after step {TRAIN_CFG['mtp_start']}")
 
     t0 = time.time()  # Track time across entire grad_accum window
+    current_seq_len = TRAIN_CFG["seq_len"]
+    indices = list(range(len(train_ds)))
+    random.shuffle(indices)
+
     while step < TRAIN_CFG["total_steps"]:
-        loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"], max_len=TRAIN_CFG["seq_len"])
+        # Update sequence length based on curriculum
+        new_seq_len = get_current_seq_len(step)
+        if new_seq_len != current_seq_len:
+            current_seq_len = new_seq_len
+            print(f"  ── Sequence length changed to {current_seq_len} at step {step}")
+
+        # Create dataloader with current sequence length
+        loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"], max_len=current_seq_len, indices=indices)
 
         for input_ids, targets in loader:
             if step >= TRAIN_CFG["total_steps"]:
@@ -185,10 +209,15 @@ def train():
                 accum_loss = 0.0
                 tok_per_sec = (input_ids.shape[1] * TRAIN_CFG["grad_accum"]) / elapsed
 
-                print(f"step {step:4d} | loss {avg_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.3f} | {tok_per_sec:.0f} tok/s")
-                log.append({"step": step, "loss": avg_loss, "lr": lr})
+                mtp_status = "ON" if step >= TRAIN_CFG["mtp_start"] else "OFF"
+                print(f"step {step:4d} | loss {avg_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.3f} | {tok_per_sec:.0f} tok/s | seq {current_seq_len} | mtp {mtp_status}")
+                log.append({"step": step, "loss": avg_loss, "lr": lr, "seq_len": current_seq_len})
 
                 t0 = time.time()  # Reset timer for next window
+
+                # Reshuffle indices at epoch boundary
+                if step % len(indices) == 0:
+                    random.shuffle(indices)
 
             # Eval
             if step % TRAIN_CFG["eval_every"] == 0 and step > 0:

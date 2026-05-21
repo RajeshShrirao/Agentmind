@@ -78,7 +78,9 @@ class MambaBlock(nn.Module):
         # h_t = dA_t * h_{t-1} + dB_t * x_t
         # In log space: log_h_t = log(dA_t) + log_h_{t-1} (prefix sum)
         log_dA = dt[:, :, :, None] * A[None, None]           # [B, L, d_inner, d_state]
-        log_dBx = mx.log(mx.abs(dB * x[:, :, :, None]) + 1e-8)  # [B, L, d_inner, d_state]
+        # Clamp to prevent log(0) and numerical instability
+        dBx = dB * x[:, :, :, None]
+        log_dBx = mx.log(mx.abs(dBx) + 1e-8)  # [B, L, d_inner, d_state]
 
         # Prefix sum of log_dA gives cumulative product
         log_prefix = mx.cumsum(log_dA, axis=1)               # [B, L, d_inner, d_state]

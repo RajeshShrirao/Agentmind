@@ -10,8 +10,17 @@
 agentmind/
 ├── data/
 │   ├── pipeline.py          # dataset loading, formatting, batching
-│   ├── synthetic.py         # tool call trajectory generator
+│   ├── synthetic.py         # tool call trajectory generator (legacy)
 │   └── formats.py           # JSONL schema definitions
+├── prepare_data/
+│   ├── base.py              # Shared: HF download, format conversion, combine/split/write
+│   ├── domain_configs.py    # Per-domain HF dataset list + synthetic counts
+│   ├── tool_caller.py       # Hermes + AgentInstruct → tool_call patterns
+│   ├── planner.py           # AgentTrove + AgentInstruct → multi-step trajectories
+│   ├── recovery.py          # Synthetic-only failure recovery
+│   ├── code.py              # the-stack + CodeAlpaca → code tool calls
+│   ├── research.py          # FineWeb + UltraChat → research pipelines
+│   └── run_all.py           # Orchestrates all 5, outputs summary, builds router
 ├── model/
 │   ├── rope.py              # RoPE for attention blocks
 │   ├── mtp_head.py          # Multi-Token Prediction auxiliary head
@@ -32,23 +41,24 @@ agentmind/
 
 AgentMind uses a **multi-source data strategy** combining open datasets, curated corpora, and synthetic agent trajectories.
 
-#### Open Datasets (HF Hub)
-| Dataset | Lines | Purpose |
+#### Open Datasets (HF Hub) — via `prepare_data/run_all.py`
+| Dataset | Target | Domain |
 |---|---|---|
-| FineWeb | 20,001 | General text, reasoning, instruction following |
-| The Stack (Python) | 9,904 | Code structure, JSON, function patterns |
-| UltraChat | 63,086 | Multi-turn dialogue, system prompts |
-| AgentInstruct | ~5,000 | High-quality agent trajectories (THUDM) |
-| ToolBench | ~3,000 | Tool calling patterns |
-| WebArena | ~3,000 | Web navigation agent data |
+| `lambda/hermes-agent-reasoning-traces` (kimi + glm-5.1 configs) | 6,000 | tool_caller — real tool calls with reasoning blocks |
+| `THUDM/AgentInstruct` (os, mind2web, webshop splits) | 5,000 | tool_caller + planner — multi-step agent trajectories |
+| `open-thoughts/AgentTrove` | 5,000 | planner — 1.7M agentic traces, ShareGPT format |
+| `bigcode/the-stack` (Python subset via data_dir) | 10,000 | code — real-world Python code |
+| `sahil2801/CodeAlpaca-20k` | 5,000 | code — instruction-following code tasks |
+| `HuggingFaceFW/fineweb` (sample-10BT config) | 10,000 | research — clean general text, reasoning |
+| `HuggingFaceH4/ultrachat_200k` | 5,000 | research — multi-turn instructional chat |
 
-#### Synthetic Data
-| Source | Samples | Types |
+#### Synthetic Data (fallback)
+| Source | Per-Domain | Total |
 |---|---|---|
-| `generate_synthetic.py` | 1,703 | instruction, tool_single, agent_multi, recovery |
-| `generate_scaled_synthetic.py` | 11,500 | instruction (3K), tool_single (2.5K), agent_multi (3K), recovery (2K), latent (1K) |
+| `prepare_data/` pipeline | 15,000–30,000 per domain | 110,000 |
+| `generate_scaled_synthetic.py` | generators imported as fallback | reused |
 
-**Total synthetic: 13,203 samples** across 5 types with 14 tools in registry.
+**Target: 25K–35K samples per domain** (HF + synthetic hybrid), 14 tools in registry.
 
 #### Special Tokens in Data
 All special tokens (`<|tool_call|>`, `<|observe|>`, `<|plan|>`, `<|scratch|>`, `<|think_start|>`, `<|think_end|>`) are present in both the corpus and synthetic data. Token IDs are derived from the tokenizer at runtime via `hydrate_config()` — pad=0, bos=1, eos=2, unk=3, all agentic control tokens occupy positions ~31987–31999.
@@ -1037,13 +1047,14 @@ The SSM recurrence `h_t = dA_t * h_{t-1} + dBx_t` must be computed over the full
 ## Quick Execution Order
 
 ```bash
-# 1. Build corpus from open datasets (FineWeb, The Stack, UltraChat, AgentInstruct, ToolBench, WebArena)
+# 1. Generate apprentice training data (HF + synthetic hybrid)
+python prepare_data/run_all.py
+#    Or offline: python prepare_data/run_all.py --skip-hf
+
+# 2. Build corpus from open datasets (for tokenizer retraining, optional)
 python build_corpus.py
 
-# 2. Generate scaled synthetic data (11.5K template + Cerebras)
-python generate_scaled_synthetic.py
-
-# 3. Train tokenizer on combined corpus
+# 3. Train tokenizer on combined corpus (if retokenizing)
 python -c "from tokenizer_setup import train_tokenizer; train_tokenizer('data/corpus.txt')"
 
 # 4. Pre-tokenize dataset (optional, but 2x faster loading)
@@ -1074,9 +1085,10 @@ python agent.py --model agentmind-4bit --query "your query"
 
 | Script | Purpose | Output |
 |---|---|---|
-| `build_corpus.py` | Downloads 6 open datasets from HF Hub | `data/corpus.txt` (~250MB) |
-| `generate_synthetic.py` | Initial synthetic data (Cerebras) | `data/synthetic_agents.jsonl` (1.7K) |
-| `generate_scaled_synthetic.py` | Scaled synthetic (templates + Cerebras, rate-limited) | `data/scaled_synthetic.jsonl` (11.5K) |
+| `build_corpus.py` | Downloads open datasets for tokenizer retraining | `data/corpus.txt` (~250MB) |
+| `generate_scaled_synthetic.py` | Template-based synthetic generators | Imported by `prepare_data/` as fallback |
+| `prepare_data/run_all.py` | **Primary**: HF + synthetic per-domain pipeline | `data/apprentice_*.jsonl` (25-35K/domain) |
+| `prepare_data/run_all.py --skip-hf` | Offline mode: synthetic-only (no HF download) | `data/apprentice_*.jsonl` (15-30K/domain) |
 
 ### Tool Registry (14 tools)
 `web_search`, `read_file`, `write_file`, `run_python`, `get_weather`, `search_arxiv`, `fetch_abstract`, `execute_sql`, `send_email`, `git_commit`, `list_directory`, `get_stock_price`, `translate`, `summarize`

@@ -564,7 +564,7 @@ python agent.py \
 |---|---|
 | `agent.py` | Full `AgentLoop` with router dispatch, adapter loading, SSM state persistence (was empty stub) |
 | `lora.py` | Add `save_adapter()`, `load_adapter()`, `reset_adapter()` for per-apprentice weight management |
-| `data/synthetic.py` | Adversarial modes: timeout, partial, corrupt, contradictory, hidden_variable, ambiguous_goal |
+| `prepare_data/` | New HF + synthetic hybrid pipeline (5 domain scripts, shared base) |
 | `train.py` | Refactor into reusable `train_specialist()` and `distill_backbone()` functions callable by orchestrator |
 | `model/mtp_head.py` | No changes needed — already correct. Used by orchestrator during distillation |
 | `model/latent.py` | No changes needed — `inject_latent_tokens()` and `latent_loss_mask()` already work per-batch |
@@ -580,18 +580,18 @@ python agent.py \
 
 ### Per-Specialist Datasets
 
-Each apprentice needs its own training corpus. `generate_scaled_synthetic.py` now outputs separate JSONL files:
+Each apprentice gets its own training corpus via `prepare_data/run_all.py`. The pipeline mixes real HuggingFace data with synthetic fallback:
 
-| File | Domain | Samples | Focus |
-|---|---|---|---|
-| `data/apprentice_tool_caller.jsonl` | Tool caller | 3,000 | Single tool calls, all 14 tools, JSON boundary tokens |
-| `data/apprentice_planner.jsonl` | Planner | 2,000 | Multi-step with `<\|plan\|>`, dependency chains, 2-5 tools |
-| `data/apprentice_recovery.jsonl` | Recovery | 2,000 | Failures, retries, fallbacks, verification, rollback decisions |
-| `data/apprentice_code.jsonl` | Code | 1,500 | Python, git, SQL, file I/O — code-specific operations |
-| `data/apprentice_research.jsonl` | Research | 1,500 | arxiv → web → fetch → summarize pipelines |
-| `data/router_training.jsonl` | Router | 1,500 | 300 per domain, labeled for classifier training |
+| File | Domain | Real HF | Synthetic | Total | Adversarial |
+|---|---|---|---|---|---|
+| `data/apprentice_tool_caller.jsonl` | Tool caller | ~6K (Hermes + AgentInstruct) | 20K | ~26K | 30% |
+| `data/apprentice_planner.jsonl` | Planner | ~8K (AgentTrove + AgentInstruct) | 25K | ~33K | 30% |
+| `data/apprentice_recovery.jsonl` | Recovery | 0 (no suitable HF data) | 30K | 30K | 40% |
+| `data/apprentice_code.jsonl` | Code | ~15K (the-stack + CodeAlpaca) | 15K | ~30K | 30% |
+| `data/apprentice_research.jsonl` | Research | ~15K (FineWeb + UltraChat) | 20K | ~35K | 30% |
+| `data/router_training.jsonl` | Router | — | — | 1,000 | 200 per domain |
 
-Total: ~10,000 samples, ~30% adversarial.
+Totals: ~110K-150K samples across 5 domains, built via `prepare_data/run_all.py`.
 
 ### Adversarial Modes
 
@@ -623,8 +623,13 @@ The router learns: `hidden_state → domain_logits`.
 ### Data Generation
 
 ```bash
-python generate_scaled_synthetic.py
-# Outputs:
+# Primary: HF + synthetic hybrid pipeline (requires network)
+python prepare_data/run_all.py
+
+# Offline: synthetic-only (no HF downloads needed)
+python prepare_data/run_all.py --skip-hf
+
+# Both output:
 #   data/apprentice_tool_caller.jsonl
 #   data/apprentice_planner.jsonl
 #   data/apprentice_recovery.jsonl
@@ -632,6 +637,8 @@ python generate_scaled_synthetic.py
 #   data/apprentice_research.jsonl
 #   data/router_training.jsonl
 ```
+
+The old `generate_scaled_synthetic.py` is still maintained as the synthetic fallback source — its generator functions are imported by the `prepare_data/` pipeline.
 
 ---
 

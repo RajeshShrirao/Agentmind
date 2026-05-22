@@ -6,6 +6,85 @@
 
 ---
 
+## `HEAD` — 2026-05-22
+
+**Cognitive Apprenticeship Pivot — Why the Dense Model Was Never Going to Work.**
+
+After the remediation sprint (token IDs, labels, registries), I sat down to retrain. And I couldn't bring myself to run `python train.py`. Something was fundamentally wrong.
+
+### The Problem
+
+The old approach was: train one dense 147M model on everything. Tool calling, planning, recovery, code, research — all in one weight matrix. At 14.4M tokens (0.5% of Chinchilla-optimal), this was never going to work. The model was memorizing formatting patterns, not learning capabilities. Loss at 0.15 wasn't a win — it was a warning sign that we were overfitting to noise.
+
+But the deeper issue wasn't just data scale. It was **architectural**. A dense model has to:
+
+1. Know how to call tools
+2. Know when to plan vs execute
+3. Know how to recover from failures
+4. Know how to research
+5. Keep all of these in one frozen weight matrix
+
+That's a lot to ask of 145M params. And every time you train a new capability, you risk forgetting an old one. The remediation fixed the token IDs but didn't fix the fundamental capacity problem.
+
+### The Pivot: Cognitive Apprenticeship
+
+Instead of one model doing everything, the new architecture decouples **knowledge from behavior**:
+
+- **Backbone (147M)**: general language understanding, world knowledge, syntax. Frozen during specialist training.
+- **Specialist Adapters (2.36M × 5)**: one tiny LoRA per domain. Trained independently. No interference because they never share gradient updates.
+- **TaskRouter (65K)**: a classifier that reads backbone hidden state and dispatches to the right specialist.
+- **Distillation**: periodically unfreeze backbone and compress specialist knowledge back in, preserving cross-domain transfer.
+
+The key insight: **adapter interference can only hurt during distillation, not during specialist training.** Each specialist trains in isolation. Distillation is controlled (β=0.5, MTP aux weight=0.2) so the backbone absorbs patterns gradually.
+
+### What Changed
+
+| Old Design | New Design |
+|---|---|
+| One dense 147M model | Backbone + 5 × 2.36M adapters |
+| All capabilities in one weight matrix | Capabilities decoupled by domain |
+| Full retrain to add capability | Train new adapter, distill |
+| Catastrophic forgetting risk | Isolated specialist training |
+| Tool semantics from data scale | Tool protocol via distillation |
+| ~6M LoRA params on backbone | 5 × 2.36M specialist adapters |
+
+### What Was Carried Forward
+
+Not everything from the old design was wrong. These survived the pivot:
+
+- **MambaBlock** with compiled sequential scan — exact parity, fast enough
+- **LocalAttentionBlock** with RoPE — window=256 for precise recall
+- **MTP heads** — now used during distillation as aux loss
+- **Latent reasoning curriculum** — integrated via `inject_latent_tokens` + `latent_loss_mask`
+- **Structured tool call decoding** — `decode.py` with 14 typed tools, 6 failure modes
+- **All 73 regression tests** — token IDs, label masking, registry parity, Mamba parity
+- **Data pipeline** — AgentDataset, pre-tokenized NPZ, make_dataloader
+- **Config-driven everything** — AgentMindConfig, curriculum schedules
+
+### The Data Reset
+
+The old 11.5K synthetic samples were too templated — every tool call looked identical. For the apprenticeship, we need the model to learn **tool semantics, not formatting**. Regenerated 10K samples per domain (50K total) with:
+
+- **Diverse args**: random ints (1-100), varied strings, edge cases
+- **Adversarial examples**: wrong tool names, missing params, type mismatches — so the model learns what *not* to do
+- **Latent reasoning paths**: `<|think_start|>...<|think_end|>` inserted at stage-appropriate rates for tool selection and planning
+
+The old data was deprecated (`data/generate_synthetic.py`). New pipeline lives in `data/generate_scaled_synthetic.py`.
+
+### What's Different About This Design
+
+**Size**: 2.36M params per adapter is small enough to train on a MacBook Air in minutes, swap in <1ms, and store as standalone .safetensors files (~9MB each).
+
+**Router dispatch**: The router is a 65K-param classifier — tiny enough to run on every token position without noticeable overhead. Fallback to "tool_caller" at confidence < 0.6 means the system degrades gracefully when uncertain.
+
+**SSM state**: Persists across specialist switches. The backbone's hidden state carries session context even as adapters swap. This is critical for multi-turn agents where the first turn might be "research" and the second "tool_call" on the result.
+
+### The Plan
+
+The 9 prompts in `instructs.md` encode this new architecture. Each prompt ends with a log+commit instruction — we're tracking every decision in BUILD_LOG.md as we go, including dead ends and discoveries. The build is public and the diary is part of the artifact.
+
+The old dense model path is abandoned. We're not building a frontier LLM. We're building an **apprentice system** — 5 tiny specialists that together know more than any single 147M model could. That's the bet.
+
 ## `7b2619b` — 2026-05-21 14:44
 
 **Scaffolding the whole thing.**
@@ -296,39 +375,42 @@ The pre-tokenized `.npz` files were regenerated with corrected labels. The pre-t
 
 | Component | Status |
 |---|---|
-| Model forward | ✅ Works (~147M params) |
-| Training loop | ✅ Runs, ~3h for 3000 steps (actual: 55s for 11.5K samples) |
-| SSM scan | ✅ Compiled sequential (exact parity verified) |
-| LoRA | ✅ Targets in_proj, out_proj, o_proj, q_proj, v_proj, lm_head |
-| Token IDs | ✅ All 13 derived from tokenizer at runtime, verified by regression guards |
-| Label masking | ✅ Correct assistant-only loss, boundary tokens preserved |
-| Latent curriculum | ✅ Loss mask fires on real think_start/think_end IDs |
-| Pre-tokenized data | ✅ Regenerated with corrected labels, path re-enabled |
-| Synthetic data | ✅ Type-correct int params, all 14 tools in all registries |
-| Tool call decoding | ✅ Structured: 14 tools, typed schemas, 6 failure modes |
-| Tool validation | ✅ Per-call validation with breakdown metrics |
-| Eval SSM state | ✅ forward_with_state in tool call & format adherence |
-| Training loop hardening | ✅ NaN recovery test harness, robust rollback and skip paths |
-| Data pipeline | ✅ Single train/val split, no data loss |
-| agent.py | ❌ Empty stub |
-| export.py | ❌ Empty stub |
+| Backbone (AgentMind-147M) | ✅ Built, 73 regression tests passing |
+| MambaBlock (compiled sequential scan) | ✅ Exact parity verified |
+| LocalAttentionBlock (RoPE, window=256) | ✅ Working |
+| MTP heads (4 × aux prediction) | ✅ Built, wired for distillation |
+| Latent curriculum (inject + mask) | ✅ Integrated in data pipeline |
+| Token IDs (dynamic from tokenizer) | ✅ Regression-guarded |
+| Tool call decoding (14 tools, 6 failure modes) | ✅ Structured validation |
+| Data pipeline (JSONL + NPZ) | ✅ Working |
+| Specialist data (10K × 5 domains) | ✅ Generated, diverse args + adversarial |
+| CognitiveApprentice wrapper | ❌ Pending (Prompt 1) |
+| TaskRouter (65K classifier) | ❌ Pending (Prompt 2) |
+| Adapter save/load/reset (lora.py) | ❌ Pending (Prompt 3) |
+| load_lora() fast swap | ❌ Pending (Prompt 4) |
+| train_specialist / distill_backbone | ❌ Pending (Prompt 5) |
+| training_orchestrator.py | ❌ Pending (Prompt 6) |
+| Per-apprentice eval + interference | ❌ Pending (Prompt 7) |
+| agent.py (router-aware loop) | ❌ Pending (Prompt 8) |
+| export_apprentice.py | ❌ Pending (Prompt 9) |
 | Memory budget | ✅ ~5GB training, <1GB inference |
-| Regression tests | ✅ 73 tests, 8 files, all passing |
 
 ### What Keeps Me Up
 
-- **14.4M tokens ≈ 0.5% of Chinchilla-optimal** for a 145M param model. The model memorizes patterns, not capabilities. Loss at 0.15 is a red flag — it's fitting noise.
-- **All training so far is invalid** — every checkpoint before this remediation was trained with broken labels. Must retrain from scratch.
-- **The latent reasoning curriculum is untested** — we have no evidence that `<|think_start|>…<|think_end|>` masking actually helps the model learn to reason internally. It might just be dead computation.
-- **Data scale is the bottleneck** — 11.5K synthetic samples is tiny. Need 2-3 orders of magnitude more diverse trajectories.
+- **The apprenticeship is untested** — the architecture makes sense on paper but the first specialist training round will reveal real problems. Adapter interference during distillation might be worse than expected. The router might not learn to discriminate at 65K params. SSM state persistence across specialist switches is speculative.
+- **Latent reasoning is still unvalidated** — we have the curriculum pipeline but zero evidence it helps. If it's noise, we cut it.
+- **2.36M params per adapter is tiny** — might not be enough capacity for complex domains like "code" or "research". Rank=16 is the default but we might need rank=32 or 64 for harder domains.
+- **Data is still the bottleneck** — 10K per domain is better than 11.5K total, but it's still templated. The model learns tool *patterns*, not tool *semantics*. Real semantic understanding requires orders of magnitude more diverse data.
 
 ---
 
 ## What's Next
 
-1. **Retrain**: All prior checkpoints are invalid (trained with broken labels). Must regenerate data and retrain from scratch.
-2. **Data scaling**: 14.4M → 2.9B tokens. Synthesis pipeline with templates → diverse variants → harder failures → agent trajectories (ReAct, ReWOO, Reflexion).
-3. **Training loop hardening**: Eval on held-out tool combos + OOD param names, cosine decay + warmup, auto-save best checkpoint, wandb logging.
-4. **Architecture**: Try Mamba-2 with `d_state=64` and data-dependent decay.
-5. **Latent reasoning**: Actually test whether the curriculum plug-in improves tool call accuracy vs vanilla. If not, cut it.
+1. **Execute the 9 prompts in `instructs.md`** — build the apprenticeship infrastructure (apprentice.py, router.py, adapter lifecycle, orchestrator, agent loop)
+2. **Train Round 1 (tool_caller)** — first real test of the architecture. Does a 2.36M adapter learn tool protocol in 500 steps?
+3. **Validate distillation** — does unfreezing the backbone with KL + MTP actually transfer specialist knowledge? Measure before/after perplexity and tool accuracy.
+4. **Train remaining 4 specialists** — does each new round interfere with previous ones? Interference testing will tell us.
+5. **Train router** — 65K params, 5 domains, 1500 samples. Does the backbone produce discriminable hidden states this early?
+6. **End-to-end agent test** — router → specialist swap → tool call → observe → continue. Does SSM state survive the switch?
+7. **Latent reasoning A/B test** — compare tool accuracy with and without the latent curriculum. If no benefit, gut it.
 

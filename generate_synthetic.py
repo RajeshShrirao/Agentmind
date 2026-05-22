@@ -1,9 +1,17 @@
 """
-Generate synthetic agent training data using Cerebras API.
-Produces 4 types of JSONL samples for AgentMind training.
+[DEPRECATED] Generate synthetic agent training data using Cerebras API.
 
-Usage: python generate_synthetic.py
-Output: data/synthetic_agents.jsonl
+This script is superseded by generate_scaled_synthetic.py which produces
+per-apprentice data with adversarial modes and latent reasoning patterns.
+
+Kept for reference and Cerebras diversity augmentation.
+To use Cerebras for additional diversity on top of scaled synthetic:
+  python generate_synthetic.py
+  # Produces data/synthetic_agents.jsonl (legacy format)
+  # This file can be merged into corpus.txt for tokenizer retraining only.
+
+For apprentice training data, use:
+  python generate_scaled_synthetic.py
 """
 
 import os
@@ -54,7 +62,7 @@ def generate_instruction():
     responses = [
         f"Based on my analysis, here are the key points:\n\n1. The topic involves several important concepts\n2. Recent developments show significant progress\n3. The implications are far-reaching",
         f"I've processed your request. Here's what I found:\n\nThe information you requested is available and shows interesting patterns. Let me know if you need more details.",
-        f"Here's a comprehensive response:\n\n• Point one: The primary finding relates to efficiency improvements\n• Point two: Secondary effects include better scalability\n• Point three: Future work should focus on optimization",
+        f"Here's a comprehensive response:\n\n• Point one: The primary finding relates to efficiency improvements\n• Point secondary: Secondary effects include better scalability\n• Point three: Future work should focus on optimization",
     ]
     return {
         "type": "instruction",
@@ -86,13 +94,13 @@ def generate_single_tool():
     }
     result = results.get(tool["name"], {"status": "ok"})
     observe = json.dumps(result)
-    
+
     followups = [
         f"Here are the results:\n{json.dumps(result, indent=2)}",
         f"The tool returned successfully. Based on the output, I can confirm the operation completed.",
         f"Task completed. The results show {json.dumps(result)}"
     ]
-    
+
     tool_key = tool["args"].get("query", tool["args"].get("city", tool["args"].get("path", "process this request")))
     return {
         "type": "tool_single",
@@ -107,18 +115,18 @@ def generate_multi_step():
     n_steps = random.randint(2, 4)
     tools = random.sample(TOOLS, min(n_steps, len(TOOLS)))
     query = random.choice(USER_QUERIES)
-    
+
     plan_steps = "\n".join(f"{i+1}. Use {t['name']}" for i, t in enumerate(tools))
     assistant_content = f"<|plan|>{plan_steps}"
-    
+
     for tool in tools:
         tool_call = json.dumps({"name": tool["name"], "args": tool["args"]})
         result = {"status": "success", "data": f"Results from {tool['name']}"}
         observe = json.dumps(result)
         assistant_content += f"<|tool_call|>{tool_call}<|observe|>{observe}"
-    
+
     assistant_content += "\n\nBased on all the gathered information, I can now provide a comprehensive answer."
-    
+
     return {
         "type": "agent_multi",
         "messages": [
@@ -133,7 +141,7 @@ def generate_recovery():
     tool_call = json.dumps({"name": tool["name"], "args": tool["args"]})
     error_result = json.dumps({"error": "timeout", "retry": True, "message": "Service temporarily unavailable"})
     success_result = json.dumps({"status": "success", "data": f"Results from {tool['name']} (retry)"})
-    
+
     return {
         "type": "recovery",
         "messages": [
@@ -174,31 +182,35 @@ Rules:
         return []
 
 def main():
+    print("=" * 60)
+    print("AgentMind — Legacy Synthetic Generator (Cerebras)")
+    print("=" * 60)
+    print("NOTE: This script is DEPRECATED. Use generate_scaled_synthetic.py")
+    print("for apprenticeship-compatible per-domain data with adversarial modes.\n")
+
     os.makedirs("data", exist_ok=True)
     output_path = "data/synthetic_agents.jsonl"
-    
-    print("Generating synthetic agent training data...")
-    
+
+    print("Generating synthetic agent training data (legacy format)...")
+
     samples = []
-    
-    # Generate rule-based samples
+
     print("[1/4] Generating instruction samples...")
     for _ in range(500):
         samples.append(generate_instruction())
-    
+
     print("[2/4] Generating single tool call samples...")
     for _ in range(500):
         samples.append(generate_single_tool())
-    
+
     print("[3/4] Generating multi-step agent samples...")
     for _ in range(500):
         samples.append(generate_multi_step())
-    
+
     print("[4/4] Generating failure recovery samples...")
     for _ in range(200):
         samples.append(generate_recovery())
-    
-    # Try Cerebras for additional diverse samples
+
     print("\nTrying Cerebras API for additional diverse samples...")
     cerebras_samples = generate_with_cerebras()
     if cerebras_samples:
@@ -206,18 +218,19 @@ def main():
         samples.extend(cerebras_samples)
     else:
         print("  → Cerebras generation skipped (using rule-based only)")
-    
-    # Shuffle and write
+
     random.shuffle(samples)
-    
+
     with open(output_path, "w") as f:
         for sample in samples:
             f.write(json.dumps(sample) + "\n")
-    
+
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"\nGenerated {len(samples)} samples → {output_path}")
     print(f"Size: {size_mb:.1f} MB")
-    print("Next: Add this to your corpus for tokenizer training")
+    print(f"\nThis data is in legacy format (no domain field).")
+    print(f"For apprenticeship training, use data/apprentice_*.jsonl from:")
+    print(f"  python generate_scaled_synthetic.py")
 
 if __name__ == "__main__":
     main()

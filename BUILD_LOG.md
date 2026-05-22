@@ -371,6 +371,80 @@ The pre-tokenized `.npz` files were regenerated with corrected labels. The pre-t
 
 ---
 
+## `d2b8f1c` — 2026-05-22
+
+**Data pipeline overhaul: prepare_data/ — HF + synthetic per-domain (25-50K/domain).**
+
+Old `generate_scaled_synthetic.py` produced 10K total template-only samples. The new `prepare_data/` pipeline targets 25-50K per domain with real HuggingFace data + synthetic fallback.
+
+### What was built
+
+```
+prepare_data/
+├── __init__.py
+├── base.py                  # Shared: HF download (streaming), format conversion, combine/split/write
+├── domain_configs.py        # Per-domain HF dataset list + synthetic counts + adversarial rates
+├── tool_caller.py           # hermes-agent-reasoning-traces + AgentInstruct → tool_call patterns
+├── planner.py               # AgentTrove + AgentInstruct (mind2web, webshop) → multi-step trajectories
+├── recovery.py              # Synthetic-only (real failure data is rare). 30K creative failure modes.
+├── code.py                  # the-stack (Python) + CodeAlpaca-20k → code tool calls
+├── research.py              # FineWeb (sample-10BT) + UltraChat → search→fetch→synthesize
+└── run_all.py               # Orchestrates all 5, outputs summary, builds router_training.jsonl
+```
+
+### dataset mapping
+
+| Domain | HF Datasets | Synthetic | Total Target |
+|---|---|---|---|
+| tool_caller | hermes-agent-reasoning-traces (6K), AgentInstruct (2K) | 20K | ~28K |
+| planner | AgentTrove (5K), AgentInstruct mind2web/webshop (3K) | 25K | ~33K |
+| recovery | — | 30K | 30K |
+| code | the-stack Python (10K), CodeAlpaca-20k (5K) | 15K | ~30K |
+| research | FineWeb 10BT (10K), UltraChat (5K) | 20K | ~35K |
+
+### Dataset availability challenges
+
+Several initially-planned HF datasets were unavailable:
+- **ToolBench/ToolBench** — removed from HF Hub. Replaced with `lambda/hermes-agent-reasoning-traces` (real tool calls with reasoning blocks, 14.7K samples).
+- **microsoft/CodeAlpaca** — HTTP 401 (private/deleted). Replaced with `sahil2801/CodeAlpaca-20k`.
+- **osunlp/WebArena** — not on HF Hub. Replaced with `open-thoughts/AgentTrove` (1.7M agentic traces, ShareGPT format).
+- **THUDM/AgentInstruct** — doesn't have a "train" split. Uses sub-configs: os, db, alfworld, webshop, kg, mind2web. Fixed to use correct split names.
+
+Other issues fixed:
+- `trust_remote_code=True` removed from `load_dataset()` (no longer supported in newer `datasets`)
+- Added `HF_HUB_DOWNLOAD_TIMEOUT=15` env default so hung downloads fail fast
+- Added `_safe_iter_dataset()` wrapper to catch per-batch stream errors without crashing
+- Added `--skip-hf` flag for offline/synthetic-only mode
+
+### Key design decisions
+
+1. **No API dependency** — synthetic fallback uses `generate_scaled_synthetic.py` generators, no Cerebras/OpenAI calls.
+2. **Streaming only** — all HF datasets use `streaming=True` to avoid disk blowup (the-stack alone is 50GB+).
+3. **Graceful degradation** — each domain script handles HF failures independently; if a dataset can't load, it falls back to synthetic-only for that domain.
+4. **Robust error handling** — `download_hf_dataset` wraps both `load_dataset` (creation) and iteration in try/except, allowing up to 3 stream errors before giving up on a dataset.
+5. **6-tuple config format** — `(name, config, split, filter_fn, max_samples, extra_kwargs)` to support datasets with configs (fineweb, hermes), special kwargs (the-stack needs data_dir), and complex filtering.
+
+### Smoke test results (--skip-hf mode)
+
+```
+Domain              Total    Synth      Adv   Latent
+tool_caller         20000    20000     5935    2916
+planner             25000    25000    13946    7031
+recovery            30000    30000    30000   15008
+code                15000    15000     4501    2252
+research            20000    20000    12788    6407
+TOTAL              110000   110000    67170   33614
+Router: 1000 samples (200 per domain)
+```
+
+HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct produced 5195 HF samples + 20K synthetic). Full pipeline with HF requires good network to HF Hub.
+
+### What was carried forward
+
+- The 5 domain generators from `generate_scaled_synthetic.py` are imported and used as synthetic fallback
+- Adversarial rates and latent reasoning patterns are preserved
+- Output format (`domain`, `type`, `messages`) is identical — backward compatible with existing training pipeline
+
 ## Current State
 
 | Component | Status |

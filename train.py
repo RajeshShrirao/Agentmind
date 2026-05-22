@@ -18,6 +18,7 @@ from init import init_agentmind
 parser = argparse.ArgumentParser()
 parser.add_argument("--max-steps", type=int, default=None, help="Override total_steps (for testing)")
 parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint dir to resume from")
+parser.add_argument("--test-nan", action="store_true", help="Run the NaN injection and recovery test harness")
 args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────
@@ -65,6 +66,168 @@ def clip_gradients(grads, max_norm: float):
     norm = mx.sqrt(sum(mx.sum(g ** 2) for g in leaves))
     scale = mx.minimum(1.0, max_norm / (norm + 1e-6))
     return tree_map(lambda g: g * scale, grads), norm.item()
+
+# ── Finiteness & Rollback Helpers ──────────────────────────
+
+def check_finite(tree):
+    for k, v in tree_flatten(tree):
+        if not mx.all(mx.isfinite(v)).item():
+            return False, k
+    return True, None
+
+def clone_tree(tree):
+    return tree_map(lambda x: mx.array(x) if isinstance(x, mx.array) else x, tree)
+
+# ── NaN Recovery Test Harness ─────────────────────────────
+
+def run_nan_test_harness():
+    print("=== Running NaN Injection and Recovery Test Harness ===")
+
+    class SmallModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = mx.array([[1.0, 2.0], [3.0, 4.0]])
+            self.w2 = mx.array([[5.0, 6.0], [7.0, 8.0]])
+
+        def __call__(self, x):
+            return x @ self.w1 @ self.w2
+
+    model = SmallModel()
+    optimizer = optim.AdamW(learning_rate=0.1)
+
+    backup_params = clone_tree(model.parameters())
+    backup_opt_state = clone_tree(optimizer.state)
+
+    def train_step_fn(input_ids, targets):
+        def loss_fn(params):
+            model.update(params)
+            pred = model(input_ids)
+            return mx.mean((pred - targets) ** 2)
+        loss, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
+        return loss, grads
+
+    x = mx.ones((1, 2))
+    y = mx.array([[10.0, 12.0]])
+
+    # 1. Normal step
+    print("Step 1: Normal training step")
+    loss, grads = train_step_fn(x, y)
+    mx.eval(loss, grads)
+
+    optimizer.update(model.trainable_parameters(), grads)
+    mx.eval(model.parameters(), optimizer.state)
+
+    backup_params = clone_tree(model.parameters())
+    backup_opt_state = clone_tree(optimizer.state)
+    print("Normal step completed. Step counter:", optimizer.state['step'].item())
+
+    pre_nan_params = clone_tree(model.parameters())
+    pre_nan_opt_state = clone_tree(optimizer.state)
+
+    # 2. Inject NaN loss
+    print("\nStep 2: Injecting NaN loss")
+    loss, grads = train_step_fn(x, y)
+    loss = mx.array(float('nan'))
+    mx.eval(loss, grads)
+
+    loss_finite = mx.isfinite(loss).item()
+    grads_finite, bad_grad_key = check_finite(grads)
+
+    if not loss_finite or not grads_finite:
+        bad_source = "loss" if not loss_finite else f"gradient in {bad_grad_key}"
+        print(f"  ⚠️  [TEST] Non-finite value detected! Source: {bad_source}. Recovering...")
+
+        # Zero gradients
+        grads = tree_map(mx.zeros_like, grads)
+
+        # Reset
+        model.update(backup_params)
+        optimizer.state = clone_tree(backup_opt_state)
+        mx.eval(model.parameters(), optimizer.state)
+        grads = tree_map(mx.zeros_like, grads)
+
+    for k, v in tree_flatten(model.parameters()):
+        assert mx.array_equal(v, pre_nan_params[k]).item(), f"Model parameter {k} was contaminated!"
+    for k in ['step', 'learning_rate']:
+        assert mx.array_equal(optimizer.state[k], pre_nan_opt_state[k]).item(), f"Optimizer state key {k} was contaminated!"
+    print("✅ Verified parameters and optimizer state are completely clean after NaN loss.")
+
+    # 3. Inject NaN gradient
+    print("\nStep 3: Injecting NaN gradient")
+    loss, grads = train_step_fn(x, y)
+    grads['w1'] = mx.array([[float('nan'), 2.0], [3.0, 4.0]])
+    mx.eval(loss, grads)
+
+    loss_finite = mx.isfinite(loss).item()
+    grads_finite, bad_grad_key = check_finite(grads)
+
+    if not loss_finite or not grads_finite:
+        bad_source = "loss" if not loss_finite else f"gradient in {bad_grad_key}"
+        print(f"  ⚠️  [TEST] Non-finite value detected! Source: {bad_source}. Recovering...")
+
+        # Zero gradients
+        grads = tree_map(mx.zeros_like, grads)
+
+        # Reset
+        model.update(backup_params)
+        optimizer.state = clone_tree(backup_opt_state)
+        mx.eval(model.parameters(), optimizer.state)
+        grads = tree_map(mx.zeros_like, grads)
+
+    for k, v in tree_flatten(model.parameters()):
+        assert mx.array_equal(v, pre_nan_params[k]).item(), f"Model parameter {k} was contaminated!"
+    for k in ['step', 'learning_rate']:
+        assert mx.array_equal(optimizer.state[k], pre_nan_opt_state[k]).item(), f"Optimizer state key {k} was contaminated!"
+    print("✅ Verified parameters and optimizer state are completely clean after NaN gradient.")
+
+    # 4. Recover and run normal step
+    print("\nStep 4: Running recovery normal step")
+    loss, grads = train_step_fn(x, y)
+    mx.eval(loss, grads)
+
+    optimizer.update(model.trainable_parameters(), grads)
+    mx.eval(model.parameters(), optimizer.state)
+    print("Recovery step completed successfully. Step counter:", optimizer.state['step'].item())
+    assert optimizer.state['step'].item() == 2, f"Expected step counter to be 2, but got {optimizer.state['step'].item()}"
+    print("✅ Verified optimizer successfully incremented step counter after recovery.")
+
+    # 5. Test gradient accumulation clearing
+    print("\nStep 5: Testing gradient accumulation clearing on skip")
+    accum_grad = None
+    accum_loss = 0.0
+
+    # Simulate step 1 of accumulation
+    loss, grads = train_step_fn(x, y)
+    mx.eval(loss, grads)
+    accum_grad = grads
+    accum_loss += loss.item()
+
+    # Simulate step 2 (NaN step) of accumulation
+    loss, grads = train_step_fn(x, y)
+    loss = mx.array(float('nan'))
+    mx.eval(loss, grads)
+
+    loss_finite = mx.isfinite(loss).item()
+    grads_finite, bad_grad_key = check_finite(grads)
+
+    if not loss_finite or not grads_finite:
+        grads = tree_map(mx.zeros_like, grads)
+        if accum_grad is not None:
+            accum_grad = tree_map(mx.zeros_like, accum_grad)
+
+        accum_grad = None
+        accum_loss = 0.0
+
+        model.update(backup_params)
+        optimizer.state = clone_tree(backup_opt_state)
+        mx.eval(model.parameters(), optimizer.state)
+        grads = tree_map(mx.zeros_like, grads)
+
+    assert accum_grad is None, "accum_grad was not cleared on skip!"
+    assert accum_loss == 0.0, "accum_loss was not cleared on skip!"
+    print("✅ Verified gradient accumulation is successfully cleared on skip.")
+
+    print("\n🎉 NaN Injection and Recovery Test Harness Passed successfully!")
 
 # ── Train step ────────────────────────────────────────────
 
@@ -173,6 +336,11 @@ def train():
     print(f"Sequence curriculum: {TRAIN_CFG['seq_len_schedule']}")
     print(f"Lazy MTP: enabled after step {TRAIN_CFG['mtp_start']}")
 
+    # Take initial clean backups
+    backup_params = clone_tree(model.parameters())
+    backup_opt_state = clone_tree(optimizer.state)
+    nan_logged = False
+
     t0 = time.time()  # Track time across entire grad_accum window
     current_seq_len = 0
 
@@ -190,13 +358,45 @@ def train():
             if step >= TRAIN_CFG["total_steps"]:
                 break
 
+            # Zero out local grads before we compute them
+            grads = None
+
+            # Compute loss and grads
             loss, grads = train_step_fn(input_ids, targets, step)
             mx.eval(loss, grads)
 
-            loss_val = loss.item()
-            if mx.isnan(loss).item():
-                print(f"  ⚠️  NaN loss at step {step} — skipping batch")
+            # Check finiteness of loss and gradients
+            loss_finite = mx.isfinite(loss).item()
+            grads_finite, bad_grad_key = check_finite(grads)
+
+            if not loss_finite or not grads_finite:
+                bad_source = "loss" if not loss_finite else f"gradient of layer '{bad_grad_key}'"
+                log_prefix = ""
+                if not nan_logged:
+                    log_prefix = "[FIRST NAN DETECTED] "
+                    nan_logged = True
+
+                print(f"  ⚠️  {log_prefix}Non-finite value detected at step {step}! Source: {bad_source}. Recovery action: Rollback parameters & optimizer state, clearing gradient accumulation, and skipping batch.")
+
+                # Zero gradients before recovery
+                grads = tree_map(mx.zeros_like, grads)
+                if accum_grad is not None:
+                    accum_grad = tree_map(mx.zeros_like, accum_grad)
+
+                # Clear gradient accumulation
+                accum_grad = None
+                accum_loss = 0.0
+
+                # Rollback model parameters and optimizer state
+                model.update(backup_params)
+                optimizer.state = clone_tree(backup_opt_state)
+                mx.eval(model.parameters(), optimizer.state)
+
+                # Zero gradients after recovery
+                grads = tree_map(mx.zeros_like, grads)
                 continue
+
+            loss_val = loss.item()
 
             # Gradient accumulation
             grads, grad_norm = clip_gradients(grads, TRAIN_CFG["grad_clip"])
@@ -210,11 +410,71 @@ def train():
             if (step + 1) % TRAIN_CFG["grad_accum"] == 0:
                 # Average accumulated gradients
                 accum_grad = tree_map(lambda g: g / TRAIN_CFG["grad_accum"], accum_grad)
+
+                # Check finiteness of accumulated gradients
+                accum_finite, bad_accum_key = check_finite(accum_grad)
+                if not accum_finite:
+                    bad_source = f"accumulated gradient of layer '{bad_accum_key}'"
+                    log_prefix = ""
+                    if not nan_logged:
+                        log_prefix = "[FIRST NAN DETECTED] "
+                        nan_logged = True
+                    print(f"  ⚠️  {log_prefix}Non-finite accumulated gradients at step {step}! Source: {bad_source}. Recovery action: Rollback parameters & optimizer state, clearing gradient accumulation, and skipping batch.")
+
+                    # Zero gradients before recovery
+                    grads = tree_map(mx.zeros_like, grads)
+                    accum_grad = tree_map(mx.zeros_like, accum_grad)
+
+                    # Clear gradient accumulation
+                    accum_grad = None
+                    accum_loss = 0.0
+
+                    # Rollback model parameters and optimizer state
+                    model.update(backup_params)
+                    optimizer.state = clone_tree(backup_opt_state)
+                    mx.eval(model.parameters(), optimizer.state)
+
+                    # Zero gradients after recovery
+                    grads = tree_map(mx.zeros_like, grads)
+                    continue
+
                 # Only update actual trainable parameters (exclude last_hidden, last_mtp_logits)
                 trainable = {k: v for k, v in model.trainable_parameters().items()
                              if not k.startswith("last_")}
                 optimizer.update(trainable, accum_grad)
                 mx.eval(model.parameters(), optimizer.state)
+
+                # Check that post-update model parameters and optimizer state are fully finite
+                post_params_finite, post_param_key = check_finite(model.parameters())
+                post_opt_finite, post_opt_key = check_finite(optimizer.state)
+                if not post_params_finite or not post_opt_finite:
+                    bad_source = f"post-update parameter '{post_param_key}'" if not post_params_finite else f"post-update optimizer state '{post_opt_key}'"
+                    log_prefix = ""
+                    if not nan_logged:
+                        log_prefix = "[FIRST NAN DETECTED] "
+                        nan_logged = True
+                    print(f"  ⚠️  {log_prefix}Non-finite values detected post-update at step {step}! Source: {bad_source}. Recovery action: Rollback parameters & optimizer state, clearing gradient accumulation, and skipping batch.")
+
+                    # Zero gradients before recovery
+                    grads = tree_map(mx.zeros_like, grads)
+
+                    # Clear gradient accumulation
+                    accum_grad = None
+                    accum_loss = 0.0
+
+                    # Rollback model parameters and optimizer state
+                    model.update(backup_params)
+                    optimizer.state = clone_tree(backup_opt_state)
+                    mx.eval(model.parameters(), optimizer.state)
+
+                    # Zero gradients after recovery
+                    grads = tree_map(mx.zeros_like, grads)
+                    continue
+
+                # Successfully updated and verified clean! Update backups.
+                backup_params = clone_tree(model.parameters())
+                backup_opt_state = clone_tree(optimizer.state)
+
                 lr = scheduler.step()
                 accum_grad = None
 
@@ -240,14 +500,19 @@ def train():
 
             # Save
             if step % TRAIN_CFG["save_every"] == 0 and step > 0:
-                try:
-                    save_path = f"{TRAIN_CFG['save_dir']}/step_{step:05d}"
-                    Path(save_path).mkdir(exist_ok=True)
-                    mx.savez(f"{save_path}/weights.npz", **dict(tree_flatten(model.parameters())))
-                    json.dump(log, open(f"{save_path}/log.json", "w"), indent=2)
-                    print(f"  ── Saved checkpoint → {save_path}")
-                except Exception as e:
-                    print(f"  ── Save failed: {e}")
+                params_finite, _ = check_finite(model.parameters())
+                opt_finite, _ = check_finite(optimizer.state)
+                if not params_finite or not opt_finite:
+                    print(f"  ⚠️  Skipping checkpoint save at step {step} because model/optimizer state contains non-finite values!")
+                else:
+                    try:
+                        save_path = f"{TRAIN_CFG['save_dir']}/step_{step:05d}"
+                        Path(save_path).mkdir(exist_ok=True)
+                        mx.savez(f"{save_path}/weights.npz", **dict(tree_flatten(model.parameters())))
+                        json.dump(log, open(f"{save_path}/log.json", "w"), indent=2)
+                        print(f"  ── Saved checkpoint → {save_path}")
+                    except Exception as e:
+                        print(f"  ── Save failed: {e}")
 
             step += 1
 
@@ -260,4 +525,7 @@ def train():
         print("Training complete (no steps logged).")
 
 if __name__ == "__main__":
-    train()
+    if args.test_nan:
+        run_nan_test_harness()
+    else:
+        train()

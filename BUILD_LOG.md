@@ -1,337 +1,215 @@
-# AgentMind — Build Log
+# AgentMind — Ship's Log
 
-> Hybrid SSM + Local Attention Language Model for Agentic AI
-> Target: ~600M params · 16GB MacBook Air · MLX Backend
-
----
-
-## Phase 1: Project Scaffolding
-
-### Directory Structure
-```
-agentmind/
-├── data/
-│   ├── __init__.py
-│   ├── formats.py          # JSONL schema definitions
-│   ├── pipeline.py         # Dataset loading, formatting, batching
-│   └── synthetic.py        # Tool call trajectory generator
-├── model/
-│   ├── __init__.py
-│   ├── mamba_block.py      # Selective State Space Model block
-│   ├── attention_block.py  # Sliding window local attention
-│   ├── hybrid_block.py     # (reserved)
-│   ├── agent_lm.py         # Full AgentMind model
-│   ├── rope.py             # Rotary Position Embeddings
-│   ├── conv_state.py       # Conv buffer for single-step inference
-│   ├── mtp_head.py         # Multi-Token Prediction auxiliary head
-│   └── latent.py           # think_start / think_end training logic
-├── config.py               # AgentMindConfig dataclass
-├── lora.py                 # LoRALinear + model wrapping
-├── init.py                 # Mamba-specific weight initialization
-├── scheduler.py            # Cosine LR with warmup
-├── train.py                # Complete training loop
-├── eval.py                 # Perplexity + tool call accuracy
-├── export.py               # GGUF export with custom arch map
-├── agent.py                # Agentic inference loop
-├── pretokenize.py          # Pre-tokenize dataset for faster loading
-├── requirements.txt        # Dependencies
-├── BUILD_LOG.md            # This file
-├── instructs.md            # Training instructions and guides
-├── docs/
-│   ├── agentmind_architecture.md
-│   └── agentmind_training_infra.md
-```
-
-### Dependencies (`requirements.txt`)
-```
-mlx
-mlx-lm
-sentencepiece
-datasets
-orjson
-msgspec
-transformers
-tqdm
-numpy
-```
+> Hybrid SSM + Local Attention LM for Agentic AI  
+> Target: ~600M → 145M params · 16GB MacBook Air · MLX Backend  
+> Log format: diary entries keyed by commit
 
 ---
 
-## Phase 2: Core Configuration
+## `7b2619b` — 2026-05-21 14:44
 
-### `config.py` — AgentMindConfig
-- **Vocabulary**: 32,000 tokens
-- **Model**: d_model=1024 (was 2048), n_layers=16 (was 24)
-- **Mamba SSM**: d_state=16 (was 128), d_conv=4, expand=2, dt_rank=auto (64)
-- **Attention**: 8 heads (was 16), local window=256 (was 512), every 4th layer
-- **FFN**: SwiGLU with 8/3 multiplier, aligned to 256
-- **Special tokens**: 10 agentic control tokens (tool_call, plan, memory, scratch, observe, think_start/end, system, user, assistant)
-- **Properties**: `d_inner`, `dt_rank_val`, `ffn_hidden`, `is_attn_layer(i)`, `param_count_estimate` (~145M raw)
-- **Config halved to fit 16GB Mac**: d_model=1024, n_layers=16, d_state=16, n_heads=8, attn_window=256
+**Scaffolding the whole thing.**
 
----
+Woke up with a Mamba-shaped hole in my life. Decided to build a hybrid SSM + attention LM that can call tools and think in latent space. Dropped the skeleton:
 
-## Phase 3: Model Components
+- `config.py` — AgentMindConfig with 13 special tokens. d_model=1024, n_layers=16, d_state=16, 8 heads, window=256. Halved everything from the original pipe dream (2048→1024, 24→16, 128→16) to keep it alive on 16GB unified memory.
+- `model/` — MambaBlock with sequential scan, LocalAttentionBlock with RoPE, AgentLM tying everything together with MTP heads and state-preserving forward. ConvState for inference-time conv buffer management.
+- `tokenizer_setup.py` — SentencePiece BPE, 32K vocab, 10 agentic control tokens as user-defined symbols.
+- Init, lora, scheduler — all stubs with signatures, waiting for flesh.
 
-### `model/rope.py` — Rotary Position Embeddings
-- `precompute_rope(head_dim, max_seq_len, base=10000.0)` — precomputes sin/cos tables
-- `apply_rope(x, cos, sin, offset=0)` — applies rotary embeddings to [B, n_heads, seq_len, head_dim]
-- Verified: output shape (1, 8, 16, 128) ✓
-
-### `model/mamba_block.py` — MambaBlock
-- Pre-norm RMSNorm → split into x (signal) + z (gate)
-- Causal depthwise conv (padding=d_conv-1, left-pad only)
-- SSM projections: x_proj → dt, B, C matrices
-- ZOH discretization: dA = exp(dt * A), dB = dt * B
-- Sequential scan loop for numerical stability (parallel log-space scan caused NaN from 0×inf underflow/overflow)
-- `step()` method for single-token O(1) inference
-- Verified: output (1, 16, 2048), hidden state (1, 1024, 16) ✓
-
-### `model/attention_block.py` — LocalAttentionBlock
-- Sliding window attention O(L × window), not O(L²)
-- RoPE integrated into q and k projections
-- SwiGLU FFN (gate_proj, up_proj, down_proj)
-- Precomputed RoPE tables stored as self.rope_cos, self.rope_sin
-- Verified: output (1, 32, 2048) ✓
-
-### `model/agent_lm.py` — AgentMind (Full Model)
-- 24 blocks: 18 Mamba + 6 Attention (3:1 ratio)
-- Pattern: [M M M A] × 6
-- Tied embedding weights to lm_head
-- `forward_with_state()` preserves SSM state across calls
-- MTP integration: `self.mtp = MTPHead(cfg, K=4)`, stores `self.last_mtp_logits`
-- Verified: logits (1, 8, 32000), 18 SSM states ✓
-
-### `model/mtp_head.py` — Multi-Token Prediction
-- `MTPHead(cfg, K=4)` — shared projection + 4 independent heads
-- `mtp_loss()` — auxiliary loss, each head predicts k+1 steps ahead
-- Verified: 4 outputs, each (1, 16, 32000) ✓
-
-### `model/conv_state.py` — ConvState
-- Manages sliding conv buffer for Mamba's causal depthwise conv
-- `step(x_t, conv_weight, conv_bias)` — single-token conv during autoregressive inference
-- Buffer: last (d_conv - 1) input vectors
+The 24-block / 600M vision in the architecture doc is aspirational. What actually compiles is 16 blocks, 145M raw params, 6M LoRA-trainable. Let's see if that's enough.
 
 ---
 
-## Phase 4: Weight Initialization
+## `0c32680` — 2026-05-21 15:23
 
-### `init.py` — init_agentmind(model, cfg)
-- Standard linear layers: std = 0.02 / sqrt(2 * n_layers)
-- **dt_proj bias**: log-uniform sampling between dt_min (1e-4) and dt_max (1e-1), then inverse softplus
-- **A_log**: broadcast arange(1, d_state+1), stored as log
-- **D**: ones (full skip connection)
-- Embedding: normal * 0.02
-- RMSNorm: weight = ones
-- Verified: runs without errors ✓
+**Synthetic data pipeline comes alive.**
+
+The model can't learn tool use from FineWeb. Built the synthetic data factory:
+
+- `generate_scaled_synthetic.py` — 11,500 samples across 5 types: instruction (3K), tool_single (2.5K), agent_multi (3K), recovery (2K), latent (1K). Template-based generation with rate-limited Cerebras API (40 req/min — pain).
+- `build_corpus.py` — downloads 6 open datasets (FineWeb, The Stack, UltraChat, AgentInstruct, ToolBench, WebArena). ~250MB of raw text.
+
+Realized the synthetic data is entirely templated — tools are called with `example_arg` placeholders. The model will learn formatting, not semantics. Decided this is fine for Phase 1 (format bedrock).
+
+- `data/synthetic.py` — 14 tools in registry. Recovery data injects failures 15% of the time. Simple but covers the token protocol.
 
 ---
 
-## Phase 5: Training Infrastructure
+## `8f08dee` — 2026-05-21 15:26
 
-### `tokenizer_setup.py` — Tokenizer Training
-- SentencePiece BPE, vocab_size=32,000
-- 10 special tokens registered as user_defined_symbols
-- byte_fallback=True, split_digits=True
-- Trained on curated corpus (see Phase 6)
+**Docs catch-up.**
 
-### Tokenizer Results
-| Token | ID |
+Wrote up the architecture doc properly. Documented the 3:1 Mamba-to-attention ratio rationale (SSM for long-range compression, attention for precise recall every 4th layer). Training infra doc got the new data strategy. The docs are now aspirational — describing what we *want* the model to be, not what it is at 145M.
+
+---
+
+## `e1a2167` — 2026-05-21 15:39
+
+**The pipeline gets real.**
+
+- `data/pipeline.py` — AgentDataset with pre-tokenized path (`.npz`) and raw JSONL path. Label masking only trains on assistant tokens. Collate pads to max_len.
+- `data/formats.py` — five JSONL schemas with `validate_sample()`. Recovery format includes `<|scratch|>` reasoning between failure and retry.
+- `model/latent.py` — the latent reasoning curriculum in 4 stages: normal → insert think boundaries → truncate CoT → full latent. `LatentReasoningWrapper` can execute N silent SSM steps. Not wired into the model yet — just the training data transformation.
+- `lora.py` — `LoRALinear` with rank=16, alpha=32. Targets in_proj, out_proj, q_proj, v_proj, lm_head. ~6M trainable params (~1% of total).
+- `scheduler.py` — Cosine warmup with linear warmup, min_lr=10% of base.
+
+I notice the latent wrapper is dead code — defined but never imported or wired. Something to fix before Phase 5.
+
+---
+
+## `af5383e` — 2026-05-21 15:41
+
+**Build log reality check.**
+
+Updated BUILD_LOG.md to match actual implementation. Config halved, d_state=16, attn_window=256. The doc had been living in the 600M fantasy. Brought it back to earth.
+
+---
+
+## `0c7e3f8` — 2026-05-21 15:49
+
+**First training loop goes in. Found bugs immediately.**
+
+- `train.py` — full training loop with gradient accumulation (batch=1, accum=8), clipping (max_norm=1.0), seq curriculum, lazy MTP.
+- `eval.py` — perplexity + tool_call_accuracy + format_adherence. 3 test prompts, 200 token generations.
+
+**Bug found**: label masking was checking for `assistant` (the string) but the token ID is 15. The `_make_labels` method in pipeline was splitting on the wrong token. Fixed by checking against `cfg.assistant_id`.
+
+Data paths were also wrong — the train script was looking in the wrong directories. Hardcoded to `/Volumes/New Volume/checkpoints` for now (external SSD, since internal disk is tight).
+
+---
+
+## `676d389` — 2026-05-21 15:53
+
+**23/23 pre-training checks pass.**
+
+Every component independently verified:
+- MambaBlock output shape ✓, SSM state shape ✓
+- AttentionBlock with RoPE ✓
+- Full model forward: logits (1, 8, 32000) ✓
+- MTP heads: 4 × (1, 16, 32000) ✓
+- Tokenizer round-trip ✓
+- Loss: 10.35 for untrained model (high, expected)
+- LoRA: 6M trainable params ✓
+
+The model can forward. Whether it can *learn* is tomorrow's problem.
+
+---
+
+## `479ac8f` — 2026-05-21 16:20
+
+**Training bugs: the great debug session.**
+
+Three bugs, three hours:
+
+1. **Padding mismatch** — `collate_batch` was padding to fixed max_len but the data samples were variable length. Short sequences got pad tokens at positions where the model expected real data. Mask was supposed to handle this but was off-by-one at sequence boundaries.
+
+2. **Eval guards** — `compute_loss` was crashing on empty batches when the val set was smaller than max_batches. Added try/except with fallback to 100.0 loss.
+
+3. **model.train/eval** — The `evaluate()` function in train.py was calling `model(input_ids)` without setting `model.eval()`. RMSNorm and dropout (if any) would behave differently. Added `model.eval()` before eval, `model.train()` after.
+
+The training loop is fragile but running. Loss goes down — that's something.
+
+---
+
+## `8ec4ae3` — 2026-05-21 18:47
+
+**Performance breakthrough: 14x speedup.**
+
+Training was going to take 42 hours. Unacceptable.
+
+- **Parallel scan** — replaced the sequential for-loop in `_ssm()` with a log-space parallel scan using `mx.cumsum`. 460-495 tok/s vs 30 tok/s for the naive loop. But: the parallel scan is numerically fragile. `0 × inf = NaN` when `exp(large_negative)` underflows and `exp(large_positive)` overflows simultaneously. Added clipping: `log_contrib ∈ [-50, 50]`.
+
+  **Concern**: the cumsum-based parallel scan assumes constant recurrence coefficients. Mamba's dt is input-dependent, so dA_t varies per timestep. The scan might be silently wrong for selective SSMs. Need to validate against the sequential version.
+
+- **Pre-tokenized data** — `pretokenize.py` converts the entire dataset to `.npz` ahead of time. 2x faster loading.
+
+- **mx.compile** — Attempted to JIT-compile the train step. MLX's compiler doesn't play well with the dynamic shapes from sequence curriculum. Reverted. Lazy evaluation mode instead.
+
+- **Fixed timing** — the timer was resetting per-batch, not per-accumulation-window. tok/s was inflated by 8x. Fixed.
+
+---
+
+## `39dd9ed` — 2026-05-21 18:54
+
+**Curriculum learning and lazy MTP.**
+
+Training 3000 steps at seq_len=2048 on a MacBook Air is masochism. Added:
+
+- **Sequence curriculum**: `{0: 256, 500: 512, 1500: 1024}` — start short, grow as the model learns. 4x faster early training.
+- **Lazy MTP**: MTP is memory-heavy (4 extra heads full forward). Disabled by default, enabled after step 500 when format is stable.
+- **Parallel scan stability**: tightened the clip bounds. Still getting occasional NaN at long sequences.
+- **batch_size=2 → 1**: The model was hitting memory pressure at batch=2 during the parallel scan (SSM intermediates blow up to ~18GB at d_state=128). Wait — d_state=16 now, intermediates are 403MB. batch=1 is overly conservative but safe.
+- **Dataloader reuse**: recreate the dataloader per curriculum change instead of per step. Saves overhead.
+
+Estimated training time dropped from 42h to ~3h. Still 0.5% of Chinchilla-optimal tokens.
+
+---
+
+## `926787c` — 2026-05-21 18:57
+
+**Updated the docs to match reality.**
+
+Training performance table in the docs was showing old numbers (42h, 30 tok/s). Updated to reflect optimizations: ~3h, 460-495 tok/s with parallel scan. Added the optimization impact table so future me knows what each knob does.
+
+---
+
+## `e1d4e4b` — 2026-05-22 14:02
+
+**Major docs surgery and code cleanup.**
+
+The architecture docs and training infra docs were referencing the old 600M design (d_model=2048, n_layers=24, d_state=128). The code had already been halved but the docs hadn't caught up. Fixed the mismatch.
+
+Changes across 12 files:
+
+- `config.py` — fixed property calculations to match actual values. `d_inner`, `dt_rank_val`, `ffn_hidden`, `param_count_estimate` now compute from the running config, not hardcoded assumptions.
+- `model/mamba_block.py` — the `step()` method had a hardcoded split point (`self.d_inner // 16`) that's wrong when `dt_rank != d_inner / 16`. The training path computes `dr` dynamically from `x_proj.weight.shape`. The inference path still has the bug — need to fix before it crashes.
+- `model/agent_lm.py` — cleaned up the MTP integration. `return_mtp` flag controls whether the MTP head fires. `forward_with_state` always runs MTP (for eval).
+- `train.py` — moved from hardcoded to config-driven. Sequence length schedule, latent stage, MTP start step all controllable. Gradient clipping with proper norm computation.
+- `eval.py` — added `model.eval()`/`model.train()` guards. `compute_loss` handles empty validations. `tool_call_accuracy` does argmax (deterministic), which is right for eval but the actual agent needs temperature sampling.
+- `lora.py` — `LoRALinear` now handles the base weight correctly. Freeze → replace flow is order-safe.
+- `tokenizer_setup.py` — eos_id=5 (not 2). The gap between SentencePiece default and our custom assignments is a footgun.
+
+**Still broken / missing:**
+- `LatentReasoningWrapper` is dead code. Never wired into `agent_lm.py`.
+- `ConvState` is defined but never used in `MambaBlock.step()` — the conv is skipped during inference.
+- `step()` has the wrong `dt_rank` split. Will crash on first inference call.
+- `agent.py` and `export.py` are still empty stubs.
+- The 11.5K synthetic samples cover formatting but not real tool semantics.
+
+---
+
+## Current State
+
+| Component | Status |
 |---|---|
-| `<pad>` | 0 |
-| `<bos>` | 1 |
-| `<eos>` | 5 |
-| `<|tool_call|>` | 6 |
-| `<|plan|>` | 7 |
-| `<|memory|>` | 8 |
-| `<|scratch|>` | 9 |
-| `<|observe|>` | 10 |
-| `<|think_start|>` | 11 |
-| `<|think_end|>` | 12 |
-| `<|system|>` | 13 |
-| `<|user|>` | 14 |
-| `<|assistant|>` | 15 |
+| Model forward | ✅ Works (145M params) |
+| Training loop | ✅ Runs, ~3h for 3000 steps |
+| Parallel scan | ⚠️ Numerically clipped, may be mathematically incomplete |
+| LoRA | ✅ 6M trainable params |
+| Pre-tokenized data | ✅ 2x loading speedup |
+| Tokenizer | ✅ 32K BPE with 13 special tokens |
+| Synthetic data | ✅ 11.5K samples |
+| Latent reasoning wrapper | ❌ Dead code |
+| Inference conv state | ❌ Conv skipped in `step()` |
+| Inference dt_rank split | ❌ Will crash on first call |
+| agent.py | ❌ Empty stub |
+| export.py | ❌ Empty stub |
+| Memory budget | ✅ ~5GB training, <1GB inference |
 
-Roundtrip encoding/decoding verified ✓
+### What Keeps Me Up
 
----
-
-## Phase 6: Data Pipeline
-
-### Corpus Construction (`build_corpus.py`)
-| Source | Lines | Purpose |
-|---|---|---|
-| FineWeb | 20,001 | General text, reasoning, instruction following |
-| The Stack (Python) | 9,904 | Code structure, JSON, function patterns |
-| UltraChat | 63,086 | Multi-turn dialogue, system prompts |
-| AgentInstruct | ~5,000 | High-quality agent trajectories |
-| ToolBench | ~3,000 | Tool calling patterns |
-| WebArena | ~3,000 | Web navigation agent data |
-| **Total** | **~104,000** | **~250MB** |
-
-### Synthetic Data - Scaled (`generate_scaled_synthetic.py`)
-- **11,500 samples** generated via template-based generation
-- Rate-limited Cerebras API (40 req/min) for high-quality diversity
-- 14 tools in registry with realistic args/results
-
-| Type | Count | Purpose |
-|---|---|---|
-| `instruction` | 3,000 | Simple Q&A, instruction following |
-| `tool_single` | 2,500 | One tool call chain |
-| `agent_multi` | 3,000 | 2-5 step tool chains with `<|plan|>` |
-| `recovery` | 2,000 | Tool errors + `<|scratch|>` reasoning + retry |
-| `latent` | 1,000 | `<|think_start|>`...`<|think_end|>` patterns |
-| **Total** | **11,500** | **6.2 MB** |
-
-### Final Training Data
-- **Corpus**: ~250 MB (general text + code + dialogue + agent datasets)
-- **Synthetic JSONL**: 11,500 structured agent trajectories
-- **Special tokens**: All present in both corpus and synthetic data
+- **d_state=16** is a post-it note, not a memory. 384K scalars for the entire "persistent cognition" of the system. That's about 96 bytes of information per forward pass.
+- **3,000 steps × 8 effective batch × 600 avg seq_len = 14.4M tokens**. For a 145M param model, that's 0.1× Chinchilla. The model will memorize patterns, not acquire capabilities.
+- **The parallel scan is not the associative scan from the Mamba paper**. The cumsum approach works for constant-coefficient recurrences but Mamba's dt varies per token. This might produce silent gradient errors.
+- **Every tool call is formatted imitation**. The model has no schema awareness, no tool registry, no structured decoding. It's a text pattern, not tool use.
 
 ---
 
-## Architecture Decisions
+## What's Next
 
-### Why 3:1 Mamba-to-Attention Ratio?
-- Mamba carries long tool history, compressed into fixed state
-- Attention fires every 4th layer for precise token recall and structured output
-- Local window (512) keeps attention cost O(L) not O(L²)
-
-### Why LoRA?
-- 16GB MacBook Air memory constraint
-- ~1.2GB weights (fp16) + ~100MB LoRA params + ~3GB activations = ~5GB total
-- Targets: in_proj, out_proj, q_proj, v_proj, lm_head
-- **6M trainable params** (~1% of total)
-
-### Why MTP (Multi-Token Prediction)?
-- Forces model to think ahead — improves instruction following
-- K=4 heads with shared projection to avoid parameter explosion
-- Auxiliary loss weight: 0.2-0.3
-
-### Memory Budget
-| Phase | What | Size |
-|---|---|---|
-| Training (LoRA) | Weights fp16 | ~1.2GB |
-| Training (LoRA) | LoRA params + optimizer | ~100MB |
-| Training (LoRA) | Activations (batch=1, seq=2048) | ~3GB |
-| **Training total** | | **~5GB ✓** |
-| Inference (4-bit) | Weights GGUF | ~300MB |
-| Inference (4-bit) | SSM state (constant) | ~2MB |
-| **Inference total** | | **<1GB ✓** |
-
----
-
-## Files Created/Modified
-
-| File | Status | Description |
-|---|---|---|---|
-| `config.py` | ✅ Complete | AgentMindConfig with all properties + 13 special token IDs |
-| `model/rope.py` | ✅ Complete | RoPE precompute and apply |
-| `model/mamba_block.py` | ✅ Complete | Full MambaBlock with parallel scan + step() |
-| `model/attention_block.py` | ✅ Complete | LocalAttentionBlock with RoPE |
-| `model/agent_lm.py` | ✅ Complete | AgentMind with MTP integration |
-| `model/mtp_head.py` | ✅ Complete | MTPHead + mtp_loss |
-| `model/conv_state.py` | ✅ Complete | ConvState for inference |
-| `model/latent.py` | ✅ Complete | Latent reasoning training logic |
-| `init.py` | ✅ Complete | Mamba-specific weight init |
-| `tokenizer_setup.py` | ✅ Complete | SentencePiece training + loading |
-| `build_corpus.py` | ✅ Complete | Multi-source corpus builder (6 datasets) |
-| `generate_synthetic.py` | ✅ Complete | Cerebras-powered synthetic data |
-| `generate_scaled_synthetic.py` | ✅ Complete | 11.5K samples with rate limiting |
-| `pretokenize.py` | ✅ Complete | Pre-tokenize dataset to .npz for 2x faster loading |
-| `data/formats.py` | ✅ Complete | JSONL schemas + validate_sample() |
-| `data/synthetic.py` | ✅ Complete | 14 tools, trajectory generators |
-| `data/pipeline.py` | ✅ Complete | AgentDataset (pre-tokenized + raw), collate, dataloader |
-| `lora.py` | ✅ Complete | LoRALinear + apply_lora (6M trainable params) |
-| `scheduler.py` | ✅ Complete | CosineWarmupScheduler |
-| `train.py` | ✅ Complete | Full training loop with grad accum, clipping, seq curriculum, lazy MTP |
-| `eval.py` | ✅ Complete | Perplexity, tool_call_accuracy, format_adherence |
-| `data/corpus.txt` | ✅ Built | 199.7 MB training corpus |
-| `data/scaled_synthetic.jsonl` | ✅ Built | 11,500 synthetic samples (6.5MB) |
-| `data/train_ids.npz` | ✅ Built | Pre-tokenized training inputs (98MB) |
-| `data/train_labels.npz` | ✅ Built | Pre-tokenized training labels (98MB) |
-| `agentmind_tok.model` | ✅ Trained | 32K vocab BPE tokenizer (0.8MB) |
-| `agentmind_tok.vocab` | ✅ Generated | Vocabulary file |
-| `instructs.md` | ✅ Complete | Training instructions and guides |
-| `BUILD_LOG.md` | ✅ Current | Development build log |
-
----
-
-## Remaining Work
-
-### Training Infrastructure (Not Yet Implemented)
-- [ ] `export.py` — GGUF export with custom arch map
-- [ ] `agent.py` — Agentic inference loop with real tools
-
-### Pre-Training Verification (23/23 Passed ✅)
-- [x] All model components implemented and smoke-tested
-- [x] All training infrastructure implemented
-- [x] Data pipeline loads 10,925 samples correctly
-- [x] Label masking works: system/user masked (-100), assistant unmasked
-- [x] Forward pass produces correct logits shape
-- [x] Loss computation works (10.35 for untrained model)
-- [x] All imports verified
-- [x] Tokenizer trained with all 13 special tokens
-- [x] LoRA applied: 6M trainable params (~1% of total)
-
-### Known Issue: Memory Pressure on 16GB Mac
-Training the 161M param model on 16GB Mac works with these mitigations:
-- batch_size=1 with grad_accum=8 instead of batch_size=2
-- No `mx.compile` on the train step — lazy evaluation avoids materializing all intermediates
-- seq_len schedule starts at 256 instead of 512
-- MTP disabled by default (enable after memory is stable)
-- Pre-tokenized data avoids tokenizer overhead
-- **d_state=16** reduces SSM intermediates from 18.4GB to 403MB (45× reduction)
-- **Parallel scan with numerical clipping**: log_contrib ∈ [-50, 50] prevents NaN from 0×inf underflow/overflow
-
-### Performance Optimizations Applied
-| Optimization | Impact | Status |
-|---|---|---|
-| Parallel scan with numerical clipping | 460-495 tok/s (vs 30 raw loop, vs 534 unclipped) | ✅ |
-| Pre-tokenized dataset | 2x faster (no on-the-fly tokenization) | ✅ |
-| Sequence length curriculum (256→512→1024) | 4x faster early training | ✅ |
-| Lazy MTP (enabled after step 500) | Saves 20% memory | ✅ |
-| batch_size=1, grad_accum=8 | Prevents OOM on 16GB Mac | ✅ |
-| Dataloader reuse with indices shuffle | Eliminates overhead | ✅ |
-| eval_every=500 | Reduces eval bottleneck | ✅ |
-
-### Memory Budget (Revised for 16GB Mac)
-| Phase | What | Size |
-|---|---|---|
-| Training (LoRA) | Weights fp16 | ~1.2GB |
-| Training (LoRA) | LoRA params + optimizer | ~100MB |
-| Training (LoRA) | Activations (batch=1, seq=256) | ~1.5GB |
-| Training (LoRA) | Parallel scan intermediates | ~2GB peak |
-| **Training total** | | **~5GB ✓** |
-| Inference (4-bit) | Weights GGUF | ~300MB |
-| Inference (4-bit) | SSM state (constant) | ~2MB |
-| **Inference total** | | **<1GB ✓** |
-
-### Estimated Training Time
-- **Before optimizations**: ~42 hours
-- **After optimizations**: ~6-8 hours (5-7x speedup)
-- **Hardware**: 16GB MacBook Air M-series
-
-### Training Curriculum
-1. **Phase 1** — Format Bedrock (500 steps): instruction pairs, JSON formatting
-2. **Phase 2** — Tool Calling (800 steps): synthetic tool call → observe → answer
-3. **Phase 3** — Multi-step Agents (1000 steps): 3-8 round trajectories
-4. **Phase 4** — Failure Recovery (700 steps): error injection + recovery
-5. **Phase 5** — Latent Reasoning (500 steps, optional): think_start/end training
-
----
-
-## Quick Start
-
-```bash
-# Everything is ready for training
-python train.py
-
-# Or resume from latest checkpoint
-python train.py --resume latest
-
-# After training completes:
-python eval.py --checkpoint /Volumes/New Volume/checkpoints/step_03000
-python export.py --checkpoint /Volumes/New Volume/checkpoints/step_03000 --out agentmind-4bit
-python agent.py --model agentmind-4bit --query "your query"
-```
+1. Fix the inference bugs (`step()` conv skip, dt_rank split) before any real inference
+2. Wire `LatentReasoningWrapper` or kill the feature
+3. Run actual training and see if loss goes below 2.0
+4. If training works: evaluate whether tool calls are real or hallucinated patterns
+5. If training doesn't work: fall back to the sequential scan and accept slower training

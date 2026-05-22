@@ -584,7 +584,7 @@ HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct pr
 | TaskRouter (65K classifier) | ✅ Built, smoke tested |
 | Adapter save/load/reset (lora.py) | ✅ save_adapter / load_adapter / reset_adapter |
 | load_lora() fast swap | ✅ <1ms tree-walk on AgentMind |
-| train_specialist / distill_backbone | ❌ Pending (Prompt 5) |
+| train_specialist / distill_backbone | ✅ Standalone functions in train.py |
 | training_orchestrator.py | ❌ Pending (Prompt 6) |
 | Per-apprentice eval + interference | ❌ Pending (Prompt 7) |
 | agent.py (router-aware loop) | ❌ Pending (Prompt 8) |
@@ -677,6 +677,72 @@ multiple times per inference step (router → specialist → observe → special
 **Note:** `model.trainable_parameters()` returns a *nested* dict in MLX, not flat keys.
 The test uses `tree_flatten()` to produce the flat dot-separated format that
 `load_lora()` expects. Cleaner than changing the method signature.
+
+---
+
+## `[uncommitted]` — 2026-05-22
+
+**train.py — refactored into train_specialist() + distill_backbone() for apprenticeship.**
+
+Split the apprenticeship training logic out of the monolithic `train()` function into
+two focused entry points that the `training_orchestrator` calls directly:
+
+### `train_specialist(backbone, domain_dataset, domain_name, steps, lr, seq_len, latent_stage) -> adapter_weights`
+
+Trains a single LoRA specialist adapter (2.36M params) on one domain.
+
+- Calls `apply_lora()` to wrap target layers, freezing the backbone
+- Creates optimizer (AdamW, lr=2e-4, weight_decay=0.01) + cosine warmup scheduler
+- Loops: `make_dataloader` → forward → `value_and_grad` → clip → optimizer step
+- Applies `latent_loss_mask` when `latent_stage >= 3` (zeroes loss inside think boundaries)
+- **MTP explicitly disabled** — the backbone is frozen, so MTP head would compute
+  zero-gradient operations. Added a guard variable (`_mtp_guard = False` + assert)
+  as documentation and runtime safety. MTP only fires in `distill_backbone()`.
+- Returns flat dict of LoRA A/B weights (74 tensors, ~9.7 MB)
+
+### `distill_backbone(backbone, specialists, combined_data, beta, mtp_weight, steps) -> None`
+
+Distills specialist knowledge into the unfrozen backbone.
+
+- **Unfreezes backbone** — all 147M params trainable (excluding `last_` caches)
+- Builds frozen specialist model instances from weight dicts (fresh AgentMind →
+  `init_agentmind` → `apply_lora` → `load_lora` → `freeze`). These are cached
+  for the duration of distillation.
+- Pre-tokenizes `combined_data` into `(ids, labels, domain)` triples with
+  `inject_latent_tokens` applied per `latent_stage`.
+- Per-step loss:
+  ```
+  CE(backbone, labels) + beta × KL(backbone || specialist) + mtp_weight × MTP_loss(backbone)
+  ```
+- **MTP warm-up**: MTP auxiliary loss activates after step 20, giving the backbone
+  20 steps to stabilize CE+KL before adding the harder multi-token prediction task.
+- Gradient clipping (max_norm=1.0), NaN recovery (skip + zero grads).
+- Freezes backbone after completion.
+
+### Design rationale
+
+The monolithic `train()` was built for the initial pretraining phase: data loading,
+pre-tokenized paths, eval, checkpoints, sequence curriculum, lazy MTP. The apprenticeship
+loop needs something different — single-domain, no eval, no checkpoints, adapter-centric.
+
+Keeping `train()` intact preserves backward compatibility for retraining runs.
+The two new functions bypass all the monolithic machinery and go direct to the
+MLX training primitive: `value_and_grad(loss_fn)(trainable)`.
+
+### Key differences from `CognitiveApprentice`
+
+`apprentice.py` already has `CognitiveApprentice.train()` and `.distill()` — but those
+are instance methods that own a specific adapter. The new standalone functions:
+- Accept **raw adapter weights** (no object lifetime management)
+- Create specialist models on the fly from weight dicts
+- Are callable from the orchestrator without importing `CognitiveApprentice`
+- Return weights directly for the orchestrator to file/serialize
+
+### Smoke test
+```
+train_specialist: 2 steps, loss 10.34→9.61, 74 weight tensors
+distill_backbone: 2 steps, loss 10.44→9.73, CE+KL+MTP all active
+```
 
 ---
 

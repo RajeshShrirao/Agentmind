@@ -2,16 +2,18 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
-import time, json, os, random, argparse
+import time, json, os, random, argparse, copy
 from pathlib import Path
 
 from config import AgentMindConfig
 from model.agent_lm import AgentMind
 from model.mtp_head import mtp_loss
+from model.latent import inject_latent_tokens, latent_loss_mask
 from data.pipeline import AgentDataset, make_dataloader
-from lora import apply_lora
+from lora import apply_lora, LoRALinear
 from scheduler import CosineWarmupScheduler
 from init import init_agentmind
+from apprentice import kl_div
 
 # ── CLI ────────────────────────────────────────────────────
 
@@ -562,6 +564,234 @@ def train():
         print(f"Log saved → {TRAIN_CFG['save_dir']}/log.json")
     else:
         print("Training complete (no steps logged).")
+
+
+# ── Apprenticeship entry points ────────────────────────────
+
+
+def train_specialist(backbone, domain_dataset, domain_name,
+                     steps=500, lr=2e-4, seq_len=256, latent_stage=1):
+    """
+    Train a LoRA specialist adapter on a single domain.
+
+    Backbone stays FROZEN — only the 2.36M LoRA A/B matrices train.
+    MTP is DISABLED during specialist training because:
+      - The backbone MTP head (4 x 32K vocab) is larger than the adapter
+      - MTP runs on the backbone, which is frozen here
+      - Enabling it would waste compute on zero-gradient backbone params
+    """
+    # Guard: MTP must never fire when the backbone is frozen
+    _mtp_guard = False
+    assert not _mtp_guard, \
+        "MTP must not run during specialist training — backbone is frozen"
+
+    from model.latent import latent_loss_mask
+
+    if isinstance(domain_dataset, list):
+        ds = AgentDataset.__new__(AgentDataset)
+        ds.samples = domain_dataset
+        ds.cfg = backbone.cfg
+        from tokenizer_setup import load_tokenizer
+        ds.tok = load_tokenizer("agentmind_tok.model")
+        ds.ids_array = None
+        ds.labels_array = None
+        ds.latent_stage = latent_stage
+        domain_dataset = ds
+
+    domain_dataset.latent_stage = latent_stage
+
+    apply_lora(backbone, rank=16, alpha=32.0)
+
+    optimizer = optim.AdamW(learning_rate=lr, weight_decay=0.01)
+    warmup = min(50, max(1, steps // 10))
+    scheduler = CosineWarmupScheduler(optimizer, lr, warmup, steps)
+
+    trainable = {k: v for k, v in backbone.trainable_parameters().items()
+                 if not k.startswith("last_")}
+
+    backbone.train()
+    step = 0
+    t0 = time.time()
+
+    while step < steps:
+        loader = make_dataloader(domain_dataset, batch_size=1, max_len=seq_len)
+        for input_ids, targets in loader:
+            if step >= steps:
+                break
+
+            if latent_stage >= 3:
+                targets = latent_loss_mask(
+                    input_ids, targets,
+                    backbone.cfg.think_start_id, backbone.cfg.think_end_id
+                )
+
+            def loss_fn(params):
+                backbone.update(params)
+                logits, _ = backbone(input_ids, return_mtp=False)
+                return cross_entropy_loss(logits, targets)
+
+            loss, grads = mx.value_and_grad(loss_fn)(trainable)
+            mx.eval(loss, grads)
+
+            loss_finite = mx.isfinite(loss).item()
+            grads_finite, _ = check_finite(grads)
+            if not loss_finite or not grads_finite:
+                grads = tree_map(mx.zeros_like, grads)
+                optimizer.update(trainable, grads)
+                continue
+
+            grads, grad_norm = clip_gradients(grads, 1.0)
+            optimizer.update(trainable, grads)
+            mx.eval(backbone.parameters(), optimizer.state)
+            lr_now = scheduler.step()
+
+            if step % 50 == 0 or step == steps - 1:
+                tok_per_sec = (input_ids.shape[1]) / (time.time() - t0 + 1e-8)
+                print(f"[{domain_name}] step {step:3d}/{steps} "
+                      f"loss {loss.item():.4f} lr {lr_now:.2e} "
+                      f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
+                t0 = time.time()
+
+            step += 1
+
+    print(f"[train_specialist] '{domain_name}' complete ({step} steps)")
+
+    # Extract and return only LoRA A/B matrices
+    params = dict(tree_flatten(backbone.trainable_parameters()))
+    return {k: v for k, v in params.items()
+            if k.endswith('.A') or k.endswith('.B')}
+
+
+def distill_backbone(backbone, specialists, combined_data,
+                     beta=0.5, mtp_weight=0.2, steps=50,
+                     lr=1e-5, seq_len=512, latent_stage=1):
+    """
+    Distill specialist knowledge into the backbone.
+
+    Backbone is UNFROZEN — all params train.
+    MTP is ENABLED after step 20 for stability (warm-up before auxiliary loss).
+    Specialists are frozen — only used as fixed teacher models.
+
+    Loss = CE(backbone, labels)
+         + beta * KL(backbone || specialist)
+         + mtp_weight * MTP_loss(backbone)     (after step 20)
+    """
+    from model.mtp_head import mtp_loss as mtp_loss_fn
+
+    # ── Build frozen specialist models ──────────────────────
+    spec_models = {}
+    for name, weights in specialists.items():
+        m = AgentMind(backbone.cfg)
+        m = init_agentmind(m, backbone.cfg)
+        apply_lora(m)
+        m.load_lora(weights)
+        m.eval()
+        m.freeze()
+        spec_models[name] = m
+
+    # ── Pre-tokenize data with domain labels ─────────────────
+    tok = getattr(combined_data, 'tok', None)
+    if tok is None:
+        from tokenizer_setup import load_tokenizer
+        tok = load_tokenizer("agentmind_tok.model")
+
+    tokenized = []
+    samples = (combined_data.samples
+               if hasattr(combined_data, 'samples') else combined_data)
+    for sample in samples:
+        s = copy.deepcopy(sample)
+        s = inject_latent_tokens(s, tok, latent_stage)
+        text = ""
+        for msg in s["messages"]:
+            r, c = msg["role"], msg["content"]
+            if r == "system":
+                text += f"<|system|>{c}"
+            elif r == "user":
+                text += f"<|user|>{c}"
+            elif r == "assistant":
+                text += f"<|assistant|>{c}<eos>"
+        ids = tok.encode(text, add_bos=True)[:seq_len]
+        labels = [-100] * len(ids)
+        in_asst = False
+        for i, tid in enumerate(ids):
+            if tid == backbone.cfg.assistant_id:
+                in_asst = True
+            if in_asst:
+                labels[i] = tid
+            if tid in (backbone.cfg.eos_id, backbone.cfg.user_id,
+                       backbone.cfg.system_id):
+                in_asst = False
+        labels = labels[:seq_len]
+        domain = sample.get("domain", list(specialists.keys())[0])
+        tokenized.append({"ids": ids, "labels": labels, "domain": domain})
+
+    # ── Distillation loop ──────────────────────────────────
+    backbone.unfreeze()
+    trainable = {k: v for k, v in backbone.trainable_parameters().items()
+                 if not k.startswith("last_")}
+
+    optimizer = optim.AdamW(learning_rate=lr)
+    step = 0
+    t0 = time.time()
+
+    while step < steps:
+        random.shuffle(tokenized)
+        for sample in tokenized:
+            if step >= steps:
+                break
+
+            ids = mx.array([sample["ids"]])
+            labels = mx.array([sample["labels"]])
+            domain = sample["domain"]
+
+            if latent_stage >= 3:
+                labels = latent_loss_mask(
+                    ids, labels,
+                    backbone.cfg.think_start_id, backbone.cfg.think_end_id
+                )
+
+            # Specialist teacher forward (frozen, no grad)
+            spec_logits, _ = spec_models[domain](ids)
+
+            def loss_fn(params):
+                backbone.update(params)
+                b_logits, _ = backbone(ids, return_mtp=True)
+                task = cross_entropy_loss(b_logits, labels)
+                distill = kl_div(b_logits, spec_logits, labels)
+                total = task + beta * distill
+                # MTP warm-up: enable after step 20 for stability
+                if step >= 20 and mtp_weight > 0:
+                    total += mtp_loss_fn(
+                        backbone.last_mtp_logits, labels, weight=mtp_weight
+                    )
+                return total
+
+            loss, grads = mx.value_and_grad(loss_fn)(trainable)
+            mx.eval(loss, grads)
+
+            loss_finite = mx.isfinite(loss).item()
+            grads_finite, _ = check_finite(grads)
+            if not loss_finite or not grads_finite:
+                grads = tree_map(mx.zeros_like, grads)
+                optimizer.update(trainable, grads)
+                continue
+
+            grads, grad_norm = clip_gradients(grads, 1.0)
+            optimizer.update(trainable, grads)
+            mx.eval(backbone.parameters(), optimizer.state)
+
+            if step % 10 == 0 or step == steps - 1:
+                elapsed = time.time() - t0
+                print(f"[distill] step {step:3d}/{steps} "
+                      f"loss {loss.item():.4f} "
+                      f"grad_norm {grad_norm:.3f} {elapsed:.1f}s")
+                t0 = time.time()
+
+            step += 1
+
+    backbone.freeze()
+    print(f"[distill] Complete ({step} steps)")
+
 
 if __name__ == "__main__":
     if args.test_nan:

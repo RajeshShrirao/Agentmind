@@ -52,6 +52,9 @@ if args.max_steps is not None:
 # ── Loss ──────────────────────────────────────────────────
 
 def cross_entropy_loss(logits, targets):
+    # Shift logits and targets for next-token prediction
+    logits = logits[:, :-1, :]
+    targets = targets[:, 1:]
     B, L, V = logits.shape
     flat_logits  = logits.reshape(-1, V)
     flat_targets = targets.reshape(-1)
@@ -245,14 +248,22 @@ def make_train_step(model):
         trainable = {k: v for k, v in model.trainable_parameters().items()
                      if not k.startswith("last_")}
 
+        # Get dynamic latent stage and apply mask if stage >= 3
+        from model.latent import get_latent_stage, latent_loss_mask
+        stage = get_latent_stage(step)
+        if stage >= 3:
+            masked_targets = latent_loss_mask(input_ids, targets, model.cfg.think_start_id, model.cfg.think_end_id)
+        else:
+            masked_targets = targets
+
         def loss_fn(params):
             model.update(params)
             use_mtp = TRAIN_CFG["use_mtp"] and step >= TRAIN_CFG["mtp_start"]
             logits, h_states = model(input_ids, return_mtp=use_mtp)
-            main = cross_entropy_loss(logits, targets)
+            main = cross_entropy_loss(logits, masked_targets)
 
             if use_mtp and hasattr(model, "mtp"):
-                aux = mtp_loss(model.last_mtp_logits, targets,
+                aux = mtp_loss(model.last_mtp_logits, masked_targets,
                                weight=TRAIN_CFG["mtp_weight"])
                 return main + aux
             return main
@@ -297,7 +308,8 @@ def train():
     tok = load_tokenizer("agentmind_tok.model")
 
     # Use pre-tokenized data if available, otherwise use raw JSONL
-    if os.path.exists("data/train_ids.npz") and os.path.exists("data/train_labels.npz"):
+    # Force bypass loading of pre-tokenized .npz files so dynamic latent injection runs
+    if False and os.path.exists("data/train_ids.npz") and os.path.exists("data/train_labels.npz"):
         train_ds = AgentDataset(
             ["data/train_ids.npz", "data/train_labels.npz"],
             cfg=cfg, split="train", pretokenized=True
@@ -351,12 +363,23 @@ def train():
             current_seq_len = new_seq_len
             print(f"  ── Sequence length changed to {current_seq_len} at step {step}")
 
+        # Dynamically set dataset stage on creation / update
+        from model.latent import get_latent_stage
+        stage = get_latent_stage(step)
+        train_ds.latent_stage = stage
+        val_ds.latent_stage = stage
+
         # Create dataloader with current sequence length
         loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"], max_len=current_seq_len)
 
         for input_ids, targets in loader:
             if step >= TRAIN_CFG["total_steps"]:
                 break
+
+            # Update stage dynamically inside loop as well
+            stage = get_latent_stage(step)
+            train_ds.latent_stage = stage
+            val_ds.latent_stage = stage
 
             # Zero out local grads before we compute them
             grads = None
@@ -492,9 +515,10 @@ def train():
             # Eval
             if step % TRAIN_CFG["eval_every"] == 0 and step > 0:
                 try:
-                    val_loss, tool_acc = evaluate(model, val_ds, tok, cfg, max_len=current_seq_len)
-                    print(f"  ── EVAL step {step} | val_loss {val_loss:.4f} | tool_acc {tool_acc:.2%}")
-                    log[-1].update({"val_loss": val_loss, "tool_acc": tool_acc})
+                    val_loss, tool_report = evaluate(model, val_ds, tok, cfg, max_len=current_seq_len)
+                    tool_acc = tool_report.get("valid_pct", 0.0) / 100.0
+                    print(f"  ── EVAL step {step} | val_loss {val_loss:.4f} | tool_valid {tool_report.get('valid', 0)}/{tool_report.get('total', 0)} ({tool_report.get('valid_pct', 0):.1f}%) | failures: {tool_report.get('breakdown', {})}")
+                    log[-1].update({"val_loss": val_loss, "tool_acc": tool_acc, "tool_report": tool_report})
                 except Exception as e:
                     print(f"  ── EVAL skipped: {e}")
 

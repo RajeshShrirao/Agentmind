@@ -58,6 +58,14 @@ class AgentMind(nn.Module):
         logits = self.lm_head(x)  # [B, L, vocab_size]
         return logits, h_states
 
+    def load_lora(self, adapter_weights: dict):
+        for name, param in adapter_weights.items():
+            parts = name.split('.')
+            module = self
+            for part in parts[:-1]:
+                module = module[int(part)] if part.isdigit() else getattr(module, part)
+            setattr(module, parts[-1], param)
+
     def forward_with_state(self, input_ids, past_h_states=None):
         """Used during agentic inference to preserve SSM state across calls."""
         x = self.embed(input_ids)

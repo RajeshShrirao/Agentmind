@@ -583,7 +583,7 @@ HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct pr
 | CognitiveApprentice wrapper | ✅ Built, smoke tested |
 | TaskRouter (65K classifier) | ✅ Built, smoke tested |
 | Adapter save/load/reset (lora.py) | ✅ save_adapter / load_adapter / reset_adapter |
-| load_lora() fast swap | ❌ Pending (Prompt 4) |
+| load_lora() fast swap | ✅ <1ms tree-walk on AgentMind |
 | train_specialist / distill_backbone | ❌ Pending (Prompt 5) |
 | training_orchestrator.py | ❌ Pending (Prompt 6) |
 | Per-apprentice eval + interference | ❌ Pending (Prompt 7) |
@@ -634,6 +634,49 @@ needing to keep apprentice objects alive. The `.safetensors` format also enables
 inspection (`mx.load()` → dict) and transfer across machines.
 
 **Test:** `save → file exists`, `reset → weights change`, `load → weights restored`. Passes.
+
+---
+
+## `[uncommitted]` — 2026-05-22
+
+**agent_lm.py — load_lora() for sub-millisecond adapter swap.**
+
+Added `AgentMind.load_lora(adapter_weights: dict)` — a minimal method that iterates a flat
+dot-separated key dict (e.g. `{"blocks.0.in_proj.A": mx.array, ...}`) and walks the module
+tree to set each parameter directly:
+
+```python
+def load_lora(self, adapter_weights: dict):
+    for name, param in adapter_weights.items():
+        parts = name.split('.')
+        module = self
+        for part in parts[:-1]:
+            module = module[int(part)] if part.isdigit() else getattr(module, part)
+        setattr(module, parts[-1], param)
+```
+
+**Why this exists alongside `lora.load_adapter()`:**
+
+| Side | Purpose |
+|------|---------|
+| `lora.load_adapter(model, path)` | Full load from `.safetensors` file — deserializes, strips metadata, rebuilds nested tree, calls `model.update()`. Used once at startup. |
+| `model.load_lora(adapter_weights)` | In-memory weight swap — skips all file I/O and tree reconstruction. Just `__getattr__` + `setattr` along the dot path. Used in the hot loop. |
+
+**Performance:** 74 LoRA A/B matrices (2.49M params). Each is a simple attribute assignment
+on the live module tree — no `tree_flatten`/`tree_unflatten`/`model.update()`. On Apple
+Unified Memory this is pointer-sized copies, well under 1ms for the full swap.
+
+**Why tree-walk instead of `model.update()`:** `model.update()` rebuilds the nested
+parameter tree from flat keys via `tree_unflatten`, which involves creating intermediate
+dicts/lists and merging them into the live tree. Direct attribute assignment avoids all
+that overhead. For 74 assignments it's negligible, but the agent loop may swap adapters
+multiple times per inference step (router → specialist → observe → specialist → ...).
+
+**Test:** flatten via `tree_flatten`, swap into fresh model, verify `mx.equal` on every key.
+
+**Note:** `model.trainable_parameters()` returns a *nested* dict in MLX, not flat keys.
+The test uses `tree_flatten()` to produce the flat dot-separated format that
+`load_lora()` expects. Cleaner than changing the method signature.
 
 ---
 

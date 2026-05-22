@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 import math
+from pathlib import Path
 
 class LoRALinear(nn.Module):
     """
@@ -62,3 +63,85 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
     total = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
     print(f"LoRA applied | Trainable params: {total:,} ({total/1e6:.2f}M)")
     return model
+
+
+def save_adapter(model, adapter_name, save_dir):
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    path = save_dir / f"{adapter_name}.safetensors"
+
+    params = dict(tree_flatten(model.trainable_parameters()))
+    lora_params = {}
+    target_modules = set()
+    for key, val in params.items():
+        if key.endswith('.A') or key.endswith('.B'):
+            lora_params[key] = val
+            target_modules.add(key.split('.')[-2])
+
+    rank = None
+    alpha = None
+    def _find_lora(module):
+        nonlocal rank, alpha
+        if isinstance(module, LoRALinear):
+            rank = module.A.shape[0]
+            alpha = int(round(module.scale * rank))
+            return True
+        if isinstance(module, nn.Module):
+            for child in module.children().values():
+                if _find_lora(child):
+                    return True
+        elif isinstance(module, list):
+            for item in module:
+                if _find_lora(item):
+                    return True
+        elif isinstance(module, dict):
+            for item in module.values():
+                if _find_lora(item):
+                    return True
+        return False
+    _find_lora(model)
+
+    metadata = {
+        "lora_rank": str(rank or "?"),
+        "lora_alpha": str(alpha or "?"),
+        "target_modules": ",".join(sorted(target_modules)),
+    }
+    mx.save_safetensors(str(path), lora_params, metadata)
+    total_kb = sum(v.nbytes for v in lora_params.values()) // 1024
+    print(f"[lora] Saved adapter '{adapter_name}' \u2192 {path} ({total_kb} KB)")
+
+
+def load_adapter(model, adapter_path):
+    path = Path(adapter_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Adapter not found: {path}")
+
+    loaded = mx.load(str(path))
+    if 'metadata' in loaded:
+        del loaded['metadata']
+
+    nested = tree_unflatten(dict(loaded))
+    model.update(nested)
+    total_kb = sum(v.nbytes for v in loaded.values()) // 1024
+    print(f"[lora] Loaded adapter from {path} ({total_kb} KB)")
+    return model
+
+
+def reset_adapter(model):
+    def _reset(module):
+        if isinstance(module, LoRALinear):
+            r = module.A.shape[0]
+            in_features = module.A.shape[1]
+            module.A = mx.random.normal((r, in_features)) * (1 / math.sqrt(r))
+            module.B = mx.zeros_like(module.B)
+        elif isinstance(module, nn.Module):
+            for child in module.children().values():
+                _reset(child)
+        elif isinstance(module, list):
+            for item in module:
+                _reset(item)
+        elif isinstance(module, dict):
+            for item in module.values():
+                _reset(item)
+    _reset(model)
+    print("[lora] Reset all LoRA adapters to random init")

@@ -582,7 +582,7 @@ HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct pr
 | Specialist data (10K × 5 domains) | ✅ Generated, diverse args + adversarial |
 | CognitiveApprentice wrapper | ✅ Built, smoke tested |
 | TaskRouter (65K classifier) | ✅ Built, smoke tested |
-| Adapter save/load/reset (lora.py) | ❌ Pending (Prompt 3) |
+| Adapter save/load/reset (lora.py) | ✅ save_adapter / load_adapter / reset_adapter |
 | load_lora() fast swap | ❌ Pending (Prompt 4) |
 | train_specialist / distill_backbone | ❌ Pending (Prompt 5) |
 | training_orchestrator.py | ❌ Pending (Prompt 6) |
@@ -597,6 +597,43 @@ HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct pr
 - **Latent reasoning is still unvalidated** — we have the curriculum pipeline but zero evidence it helps. If it's noise, we cut it.
 - **2.36M params per adapter is tiny** — might not be enough capacity for complex domains like "code" or "research". Rank=16 is the default but we might need rank=32 or 64 for harder domains.
 - **Data is still the bottleneck** — 10K per domain is better than 11.5K total, but it's still templated. The model learns tool *patterns*, not tool *semantics*. Real semantic understanding requires orders of magnitude more diverse data.
+
+---
+
+## `[uncommitted]` — 2026-05-22
+
+**lora.py — adapter save/load/reset lifecycle (standalone functions).**
+
+Extracted the adapter lifecycle from `CognitiveApprentice`'s instance methods into standalone
+functions in `lora.py` so they can be used directly during the apprenticeship loop without
+instantiating a full `CognitiveApprentice`:
+
+- **`save_adapter(model, name, save_dir)`**: Calls `tree_flatten(model.trainable_parameters())`,
+  filters to keys ending with `.A` or `.B`, saves as MLX `.safetensors` with metadata
+  (`lora_rank`, `lora_alpha`, `target_modules`). Infers rank/alpha from the first
+  `LoRALinear` found in the model tree, target module names from the dot-path component
+  before `.A`/`.B`. Each adapter is ~9.7 MB at rank=16.
+- **`load_adapter(model, adapter_path)`**: Loads `.safetensors` via `mx.load()`, strips
+  the `metadata` key, calls `tree_unflatten()` and `model.update()` to apply weights
+  to a fresh backbone. The backbone must have the same architecture and LoRA wrapping
+  (same rank/alpha/targets) — mismatches surface as key errors from `update()`.
+- **`reset_adapter(model)`**: Walks the module tree, finds every `LoRALinear` instance,
+  re-initializes A with `random.normal / sqrt(rank)` and B with `zeros`. Does not touch
+  backbone weights. Needed between specialists to avoid cross-contamination of adapter
+  weights (each specialist starts from random, not from the previous specialist's A/B).
+
+**Why standalone functions instead of class methods:**
+The `CognitiveApprentice` owns a specific adapter instance and its training state, but
+the agent loop needs to:
+1. Save after training each specialist (no apprentice wrapper needed)
+2. Load adapters into a shared inference model (swapping in <1ms on UMA)
+3. Reset when spawning a new specialist apprentice
+
+Standalone functions let the orchestrator manage adapters as first-class files without
+needing to keep apprentice objects alive. The `.safetensors` format also enables
+inspection (`mx.load()` → dict) and transfer across machines.
+
+**Test:** `save → file exists`, `reset → weights change`, `load → weights restored`. Passes.
 
 ---
 

@@ -34,18 +34,18 @@ def init_agentmind(model, cfg):
             module.bias = inv_dt
 
         # ── Mamba-specific: A_log ────────────────────────────
-        if "A_log" in name:
+        if hasattr(module, "A_log"):
             # A controls long-term memory decay
             # Init as evenly spaced log values — empirically stable
             A = mx.broadcast_to(
                 mx.arange(1, cfg.d_state + 1, dtype=mx.float32)[None, :],
                 (cfg.d_inner, cfg.d_state)
             )
-            module.data = mx.log(A)  # stored as log for numerical stability
+            module.A_log = mx.log(A)  # stored as log for numerical stability
 
         # ── Mamba-specific: D (skip) ─────────────────────────
-        if name.endswith(".D"):
-            module.data = mx.ones(module.shape)  # ones = full skip connection
+        if hasattr(module, "D"):
+            module.D = mx.ones(module.D.shape)  # ones = full skip connection
 
         # ── Embedding ────────────────────────────────────────
         if isinstance(module, nn.Embedding):

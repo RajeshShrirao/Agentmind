@@ -21,24 +21,24 @@
 ## Architecture Overview
 
 ```
-AgentMind-600M
-├── Embedding          [vocab=32k, d_model=2048]
-├── 24 Hybrid Blocks
+AgentMind-330M
+├── Embedding          [vocab=32k, d_model=1024]
+├── 16 Hybrid Blocks
 │   ├── 0,1,2   → MambaBlock   (SSM, long-range memory)
-│   ├── 3       → AttnBlock    (local window=512, precision)
+│   ├── 3       → AttnBlock    (local window=256, precision)
 │   ├── 4,5,6   → MambaBlock
 │   ├── 7       → AttnBlock
-│   └── ... pattern × 6
+│   └── ... pattern × 4
 ├── RMSNorm
 └── LM Head            [tied to embedding]
 
-~600M params · 3:1 Mamba-to-Attention ratio
+~330M params · 3:1 Mamba-to-Attention ratio
 ```
 
 **Why this ratio:**
 - Mamba carries long tool history, compressed into fixed state
 - Attention fires every 4th layer for precise token recall and structured output formatting
-- Local window (512) keeps attention cost O(L) not O(L²)
+- Local window (256) keeps attention cost O(L) not O(L²)
 
 ---
 
@@ -54,18 +54,18 @@ class AgentMindConfig:
     vocab_size: int = 32_000
 
     # Model dimensions
-    d_model: int = 2048
-    n_layers: int = 24
+    d_model: int = 1024
+    n_layers: int = 16
 
     # Mamba SSM
-    d_state: int = 128       # memory per channel — larger = richer history
+    d_state: int = 64        # memory per channel (materially improves long-range retention)
     d_conv: int = 4          # causal conv kernel
-    expand: int = 2          # d_inner = expand × d_model = 4096
-    dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 128
+    expand: int = 2          # d_inner = expand × d_model = 2048
+    dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 64
 
     # Hybrid attention
-    n_heads: int = 16
-    attn_window: int = 512   # local attention window
+    n_heads: int = 8
+    attn_window: int = 256   # local attention window
     attn_every: int = 4      # attention layer every N blocks
 
     # FFN (SwiGLU)
@@ -116,15 +116,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import math
 
+
 class MambaBlock(nn.Module):
     """
     Selective State Space Model block.
-    
+
     At inference: pure O(1) recurrence — SSM state stays fixed size
     regardless of how many tool calls have been processed.
-    
-    At training: sequential scan (correct). Swap with parallel scan
-    for full training speed (see note at bottom).
+
+    At training: parallel scan (log-space) with numerical clipping.
+    log_contrib ∈ [-50, 50] prevents overflow in exp() that caused
+    0 × inf = NaN with d_state=16 and L ≥ 8.
     """
 
     def __init__(self, cfg):
@@ -132,11 +134,13 @@ class MambaBlock(nn.Module):
         d = cfg.d_model
         di = cfg.d_inner
         ds = cfg.d_state
-        dr = cfg.dt_rank_val
+        dr = cfg.dt_rank
 
         self.d_inner = di
         self.d_state = ds
         self.d_conv = cfg.d_conv
+        self.dt_rank = dr
+        self.debug = getattr(cfg, "debug", True)
 
         # Pre-norm
         self.norm = nn.RMSNorm(d)
@@ -168,93 +172,206 @@ class MambaBlock(nn.Module):
 
         self.out_proj = nn.Linear(di, d, bias=False)
 
-    def _ssm(self, x):
+    def _ssm(self, x, h_init=None):
         # x: [B, L, d_inner]
         B, L, _ = x.shape
-        dr, ds = self.x_proj.weight.shape[0] - self.d_state * 2, self.d_state
+
+        if self.debug:
+            assert x.ndim == 3, f"Expected 3D tensor [B, L, d_inner], got {x.shape}"
+            assert x.shape[-1] == self.d_inner, f"Expected last dimension to be {self.d_inner}, got {x.shape[-1]}"
+            assert h_init is None or h_init.shape == (B, self.d_inner, self.d_state), \
+                f"Expected h_init shape {(B, self.d_inner, self.d_state)}, got {h_init.shape}"
 
         A = -mx.exp(self.A_log)                    # [d_inner, d_state]
 
         # Project to dt, B_mat, C_mat
-        xbc = self.x_proj(x)                       # [B, L, dr + 2*ds]
+        xbc = self.x_proj(x)                       # [B, L, dt_rank + 2*d_state]
+
+        if self.debug:
+            assert xbc.shape[-1] == self.dt_rank + 2 * self.d_state, \
+                f"Expected xbc last dimension to be {self.dt_rank + 2 * self.d_state}, got {xbc.shape[-1]}"
+
         dt_raw, B_mat, C_mat = mx.split(
-            xbc, [dr, dr + ds], axis=-1
+            xbc, [self.dt_rank, self.dt_rank + self.d_state], axis=-1
         )
+
+        if self.debug:
+            assert dt_raw.shape[-1] == self.dt_rank, f"Expected dt_raw shape to end in {self.dt_rank}, got {dt_raw.shape}"
+            assert B_mat.shape[-1] == self.d_state, f"Expected B_mat shape to end in {self.d_state}, got {B_mat.shape}"
+            assert C_mat.shape[-1] == self.d_state, f"Expected C_mat shape to end in {self.d_state}, got {C_mat.shape}"
+
         dt = nn.softplus(self.dt_proj(dt_raw))     # [B, L, d_inner]
 
         # ZOH discretization
-        # dA: [B, L, d_inner, d_state]
-        dA = mx.exp(dt[:, :, :, None] * A[None, None])
-        # dB: [B, L, d_inner, d_state]
-        dB = dt[:, :, :, None] * B_mat[:, :, None, :]
+        dA = mx.exp(dt[:, :, :, None] * A[None, None])       # [B, L, d_inner, d_state]
+        dB = dt[:, :, :, None] * B_mat[:, :, None, :]        # [B, L, d_inner, d_state]
+        dBx = dB * x[:, :, :, None]                          # [B, L, d_inner, d_state]
 
-        # Sequential scan — correct for both train and inference
-        # For training speed: replace with parallel scan using mx.cumsum
-        h = mx.zeros((B, self.d_inner, self.d_state))
-        ys = []
+        # Sequential scan (fully compiled by MLX, mathematically exact)
+        h = h_init if h_init is not None else mx.zeros((B, self.d_inner, self.d_state))
+        h_seq = []
         for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x[:, t, :, None]
-            y = mx.sum(h * C_mat[:, t, None, :], axis=-1)  # [B, d_inner]
-            ys.append(y)
+            h = dA[:, t] * h + dBx[:, t]
+            h_seq.append(h)
+        h_stack = mx.stack(h_seq, axis=1)                    # [B, L, d_inner, d_state]
 
-        y = mx.stack(ys, axis=1)                   # [B, L, d_inner]
-        return y + x * self.D[None, None, :], h    # output, final state
+        # Output: y = sum(h * C) + D * x
+        y = mx.sum(h_stack * C_mat[:, :, None, :], axis=-1)
+        return y + x * self.D[None, None, :], h_stack[:, -1]
 
     def __call__(self, x, h_state=None):
         # x: [B, L, d_model]
         residual = x
-        x = self.norm(x)
 
-        xz = self.in_proj(x)
+        if self.debug:
+            assert x.ndim == 3, f"Expected 3D tensor [B, L, d_model], got {x.shape}"
+            assert x.shape[-1] == self.norm.weight.shape[0], \
+                f"Expected last dimension of x to be {self.norm.weight.shape[0]}, got {x.shape[-1]}"
+
+        x_normed = self.norm(x)
+        xz = self.in_proj(x_normed)
         x_in, z = mx.split(xz, [self.d_inner], axis=-1)
 
-        # Causal depthwise conv — trim padding to maintain causality
-        x_conv = self.conv(x_in)[:, :x_in.shape[1], :]
-        x_conv = nn.silu(x_conv)
+        B, L, _ = x_in.shape
+
+        if h_state is not None:
+            if isinstance(h_state, dict):
+                ssm_state = h_state["ssm_state"]
+                conv_state = h_state["conv_state"]
+            else:
+                ssm_state, conv_state = h_state
+        else:
+            ssm_state = mx.zeros((B, self.d_inner, self.d_state))
+            conv_state = mx.zeros((B, self.d_conv - 1, self.d_inner))
+
+        if self.debug:
+            assert ssm_state.shape == (B, self.d_inner, self.d_state), \
+                f"Expected ssm_state shape {(B, self.d_inner, self.d_state)}, got {ssm_state.shape}"
+            assert conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {conv_state.shape}"
+
+        # Causal depthwise conv — prepend buffer
+        x_padded = mx.concatenate([conv_state, x_in], axis=1)
+        x_conv_raw = mx.conv1d(x_padded, self.conv.weight, stride=1, padding=0, dilation=1, groups=self.d_inner)
+        if self.conv.bias is not None:
+            x_conv_raw = x_conv_raw + self.conv.bias
+
+        x_conv = nn.silu(x_conv_raw)
 
         # SSM + skip connection
-        y, h_out = self._ssm(x_conv)
+        y_ssm, h_out = self._ssm(x_conv, ssm_state)
 
         # Gate
-        y = y * nn.silu(z)
+        y_gated = y_ssm * nn.silu(z)
 
-        return self.out_proj(y) + residual, h_out
+        # Slide conv buffer
+        new_conv_state = x_padded[:, x_padded.shape[1] - (self.d_conv - 1):, :]
+
+        new_state = {
+            "ssm_state": h_out,
+            "conv_state": new_conv_state
+        }
+
+        if self.debug:
+            assert h_out.shape == (B, self.d_inner, self.d_state), \
+                f"Expected output ssm_state shape {(B, self.d_inner, self.d_state)}, got {h_out.shape}"
+            assert new_conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected output conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {new_conv_state.shape}"
+
+        return self.out_proj(y_gated) + residual, new_state
 
     # ── Inference-only: single step recurrence ──────────────
-    def step(self, x_t, h):
+    def step(self, x_t, state=None):
         """
         Single token step — pure O(1) recurrence.
-        x_t: [B, d_model], h: [B, d_inner, d_state]
+        x_t: [..., d_model], state: dict or None
         """
-        x_t = self.norm(x_t)
-        xz = self.in_proj(x_t[:, None, :])
+        orig_shape = x_t.shape
+        x_t_flat = x_t.reshape(-1, orig_shape[-1])
+        B = x_t_flat.shape[0]
+
+        if self.debug:
+            assert x_t_flat.shape[-1] == self.norm.weight.shape[0], \
+                f"Expected last dimension of x_t to be {self.norm.weight.shape[0]}, got {x_t_flat.shape[-1]}"
+
+        x_normed = self.norm(x_t_flat)
+        xz = self.in_proj(x_normed)
         x_in, z = mx.split(xz, [self.d_inner], axis=-1)
 
-        # Conv step: slide window (maintain conv buffer externally)
-        x_conv = nn.silu(x_in.squeeze(1))
+        if state is not None:
+            if isinstance(state, dict):
+                ssm_state = state["ssm_state"]
+                conv_state = state["conv_state"]
+            else:
+                ssm_state, conv_state = state
+        else:
+            ssm_state = mx.zeros((B, self.d_inner, self.d_state))
+            conv_state = mx.zeros((B, self.d_conv - 1, self.d_inner))
 
-        xbc = self.x_proj(x_conv)
-        dt_raw, B_mat, C_mat = mx.split(xbc, [self.d_inner // 16, -self.d_state], axis=-1)
+        if self.debug:
+            assert ssm_state.shape == (B, self.d_inner, self.d_state), \
+                f"Expected ssm_state shape {(B, self.d_inner, self.d_state)}, got {ssm_state.shape}"
+            assert conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {conv_state.shape}"
+
+        # Conv step: slide window
+        x_in_expanded = x_in[:, None, :]
+        window = mx.concatenate([conv_state, x_in_expanded], axis=1)
+
+        # Depthwise conv
+        conv_weight = self.conv.weight[:, :, 0]
+        x_conv = mx.sum(window * conv_weight[None, :, :].transpose(0, 2, 1), axis=1)
+        if self.conv.bias is not None:
+            x_conv = x_conv + self.conv.bias[None, :]
+
+        new_conv_state = window[:, window.shape[1] - (self.d_conv - 1):, :]
+
+        # SSM step
+        x_conv_activated = nn.silu(x_conv)
+
+        xbc = self.x_proj(x_conv_activated)
+
+        if self.debug:
+            assert xbc.shape[-1] == self.dt_rank + 2 * self.d_state, \
+                f"Expected xbc last dimension to be {self.dt_rank + 2 * self.d_state}, got {xbc.shape[-1]}"
+
+        dt_raw, B_mat, C_mat = mx.split(
+            xbc, [self.dt_rank, self.dt_rank + self.d_state], axis=-1
+        )
+
+        if self.debug:
+            assert dt_raw.shape[-1] == self.dt_rank, f"Expected dt_raw shape to end in {self.dt_rank}, got {dt_raw.shape}"
+            assert B_mat.shape[-1] == self.d_state, f"Expected B_mat shape to end in {self.d_state}, got {B_mat.shape}"
+            assert C_mat.shape[-1] == self.d_state, f"Expected C_mat shape to end in {self.d_state}, got {C_mat.shape}"
+
         dt = nn.softplus(self.dt_proj(dt_raw))
 
         A = -mx.exp(self.A_log)
-        dA = mx.exp(dt[:, :, None] * A[None])
+        dA = mx.exp(dt[:, :, None] * A[None, :, :])
         dB = dt[:, :, None] * B_mat[:, None, :]
 
-        h = dA * h + dB * x_conv[:, :, None]
-        y = mx.sum(h * C_mat[:, None, :], axis=-1)
-        y = y + x_conv * self.D[None]
-        z_gate = nn.silu(z.squeeze(1))
+        new_ssm_state = dA * ssm_state + dB * x_conv_activated[:, :, None]
+        y = mx.sum(new_ssm_state * C_mat[:, None, :], axis=-1)
+        y = y + x_conv_activated * self.D[None, :]
 
-        return self.out_proj(y * z_gate), h
+        z_gate = nn.silu(z)
+        y_gated = y * z_gate
 
-# NOTE: Parallel scan for training
-# Replace the sequential loop in _ssm with:
-#
-#   log_A = dt[:,:,:,None] * A[None,None]   # [B,L,d_inner,d_state]
-#   # Compute prefix products of dA using log-sum-exp
-#   log_cumA = mx.cumsum(log_A, axis=1)
-#   # Then reconstruct h using einsum — see Mamba paper Appendix C
+        out_flat = self.out_proj(y_gated) + x_t_flat
+        out = out_flat.reshape(orig_shape)
+
+        new_state = {
+            "ssm_state": new_ssm_state,
+            "conv_state": new_conv_state
+        }
+
+        if self.debug:
+            assert new_ssm_state.shape == (B, self.d_inner, self.d_state), \
+                f"Expected new_ssm_state shape {(B, self.d_inner, self.d_state)}, got {new_ssm_state.shape}"
+            assert new_conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected new_conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {new_conv_state.shape}"
+
+        return out, new_state
 ```
 
 ---

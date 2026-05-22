@@ -11,7 +11,7 @@ class AgentMindConfig:
     n_layers: int = 16
 
     # Mamba SSM
-    d_state: int = 16        # memory per channel
+    d_state: int = 64        # memory per channel (materially improves long-range retention)
     d_conv: int = 4          # causal conv kernel
     expand: int = 2          # d_inner = expand × d_model = 4096
     dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 64

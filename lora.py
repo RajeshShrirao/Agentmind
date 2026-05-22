@@ -11,24 +11,18 @@ class LoRALinear(nn.Module):
 
     def __init__(self, base: nn.Linear, rank: int = 16, alpha: float = 32.0):
         super().__init__()
+        self.scale = alpha / rank
+        self.base = base
+
         in_features  = base.weight.shape[1]
         out_features = base.weight.shape[0]
-        self.scale = alpha / rank
-
-        # Freeze base weight (not a parameter)
-        self.weight = base.weight          # frozen
-        self.bias   = getattr(base, "bias", None)
 
         # Trainable low-rank matrices
         self.A = mx.random.normal((rank, in_features)) * (1 / math.sqrt(rank))
         self.B = mx.zeros((out_features, rank))
 
     def __call__(self, x):
-        base_out = x @ self.weight.T
-        if self.bias is not None:
-            base_out = base_out + self.bias
-        lora_out = (x @ self.A.T) @ self.B.T
-        return base_out + self.scale * lora_out
+        return self.base(x) + self.scale * (x @ self.A.T) @ self.B.T
 
 def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = None):
     """
@@ -45,16 +39,22 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
     # Freeze entire model first
     model.freeze()
 
-    # Walk and replace target layers
+    # Walk and replace target layers recursively
     def _replace(module):
-        for name in module.children():
-            child = getattr(module, name)
-            if isinstance(child, nn.Linear):
-                if any(t in name for t in targets):
-                    lora_layer = LoRALinear(child, rank=rank, alpha=alpha)
-                    setattr(module, name, lora_layer)
-            elif isinstance(child, nn.Module):
-                _replace(child)
+        if isinstance(module, nn.Module):
+            for name, child in list(module.children().items()):
+                if isinstance(child, nn.Linear):
+                    if any(t in name for t in targets):
+                        lora_layer = LoRALinear(child, rank=rank, alpha=alpha)
+                        setattr(module, name, lora_layer)
+                else:
+                    _replace(child)
+        elif isinstance(module, list):
+            for item in module:
+                _replace(item)
+        elif isinstance(module, dict):
+            for item in module.values():
+                _replace(item)
 
     _replace(model)
 

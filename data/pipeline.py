@@ -85,6 +85,8 @@ class AgentDataset:
                 in_assistant = True
             if in_assistant:
                 labels[i] = tok_id
+            if tok_id == self.cfg.eos_id or tok_id == self.cfg.user_id or tok_id == self.cfg.system_id:
+                in_assistant = False
         return labels
 
     def __len__(self):
@@ -123,6 +125,8 @@ def collate_batch(samples: list, pad_id: int = 0, max_len: int = 2048) -> tuple:
 def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True, max_len: int = 2048, indices: list = None) -> Iterator:
     if indices is None:
         indices = list(range(len(dataset)))
+    else:
+        indices = list(indices)  # copy to avoid mutating caller's list
     if shuffle:
         random.shuffle(indices)
 

@@ -7,18 +7,18 @@ class AgentMindConfig:
     vocab_size: int = 32_000
 
     # Model dimensions
-    d_model: int = 2048
-    n_layers: int = 24
+    d_model: int = 1024
+    n_layers: int = 16
 
     # Mamba SSM
-    d_state: int = 128       # memory per channel — larger = richer history
+    d_state: int = 16        # memory per channel
     d_conv: int = 4          # causal conv kernel
     expand: int = 2          # d_inner = expand × d_model = 4096
     dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 128
 
     # Hybrid attention
-    n_heads: int = 16
-    attn_window: int = 512   # local attention window
+    n_heads: int = 8
+    attn_window: int = 256   # local attention window
     attn_every: int = 4      # attention layer every N blocks
 
     # FFN (SwiGLU)
@@ -31,17 +31,17 @@ class AgentMindConfig:
     # Special token IDs (assigned after tokenizer init)
     pad_id: int = 0
     bos_id: int = 1
-    eos_id: int = 2
-    tool_call_id: int = 3
-    plan_id: int = 4
-    memory_id: int = 5
-    scratch_id: int = 6
-    observe_id: int = 7
-    think_start_id: int = 8
-    think_end_id: int = 9
-    system_id: int = 11
-    user_id: int = 12
-    assistant_id: int = 13
+    eos_id: int = 5
+    tool_call_id: int = 6
+    plan_id: int = 7
+    memory_id: int = 8
+    scratch_id: int = 9
+    observe_id: int = 10
+    think_start_id: int = 11
+    think_end_id: int = 12
+    system_id: int = 13
+    user_id: int = 14
+    assistant_id: int = 15
 
     @property
     def d_inner(self) -> int:

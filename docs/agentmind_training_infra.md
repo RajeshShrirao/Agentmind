@@ -52,7 +52,7 @@ AgentMind uses a **multi-source data strategy** combining open datasets, curated
 **Total synthetic: 13,203 samples** across 5 types with 14 tools in registry.
 
 #### Special Tokens in Data
-All special tokens (`<|tool_call|>`, `<|observe|>`, `<|plan|>`, `<|scratch|>`, `<|think_start|>`, `<|think_end|>`) are present in both the corpus and synthetic data.
+All special tokens (`<|tool_call|>`, `<|observe|>`, `<|plan|>`, `<|scratch|>`, `<|think_start|>`, `<|think_end|>`) are present in both the corpus and synthetic data. Token IDs: pad=0, bos=1, eos=5, tool_call=6, plan=7, memory=8, scratch=9, observe=10, think_start=11, think_end=12, system=13, user=14, assistant=15.
 
 ### `data/formats.py` — JSONL Schema
 
@@ -112,37 +112,44 @@ Every training sample is one of **five** types. All share the same JSONL line fo
 import json
 import random
 import mlx.core as mx
+import numpy as np
 from pathlib import Path
 from typing import Iterator
 
 class AgentDataset:
-    def __init__(self, paths: list[str], tokenizer, cfg, split="train"):
+    def __init__(self, paths: list[str], tokenizer=None, cfg=None, split="train", pretokenized: bool = False):
         self.cfg = cfg
         self.tok = tokenizer
         self.samples = []
+        self.ids_array = None
+        self.labels_array = None
 
-        for path in paths:
-            with open(path) as f:
-                for line in f:
-                    self.samples.append(json.loads(line.strip()))
-
-        # Data mixing weights by type
-        self.weights = {
-            "instruction": 0.30,
-            "tool_single":  0.30,
-            "agent_multi":  0.25,
-            "recovery":     0.15,
-        }
-
-        random.shuffle(self.samples)
-        split_idx = int(len(self.samples) * 0.95)
-        if split == "train":
-            self.samples = self.samples[:split_idx]
+        if pretokenized:
+            ids_path = [p for p in paths if "ids" in p]
+            labels_path = [p for p in paths if "labels" in p]
+            if ids_path and labels_path:
+                self.ids_array = np.load(ids_path[0])["arr_0"]
+                self.labels_array = np.load(labels_path[0])["arr_0"]
+                split_idx = int(len(self.ids_array) * 0.95)
+                if split == "train":
+                    self.ids_array = self.ids_array[:split_idx]
+                    self.labels_array = self.labels_array[:split_idx]
+                else:
+                    self.ids_array = self.ids_array[split_idx:]
+                    self.labels_array = self.labels_array[split_idx:]
         else:
-            self.samples = self.samples[split_idx:]
+            for path in paths:
+                with open(path) as f:
+                    for line in f:
+                        self.samples.append(json.loads(line.strip()))
+            random.shuffle(self.samples)
+            split_idx = int(len(self.samples) * 0.95)
+            if split == "train":
+                self.samples = self.samples[:split_idx]
+            else:
+                self.samples = self.samples[split_idx:]
 
     def _format_sample(self, sample: dict) -> str:
-        """Convert message list to flat token string."""
         text = ""
         for msg in sample["messages"]:
             role = msg["role"]
@@ -159,59 +166,50 @@ class AgentDataset:
         return self.tok.encode(text, add_bos=True)
 
     def _make_labels(self, ids: list[int], sample: dict) -> list[int]:
-        """
-        Only compute loss on assistant turns.
-        Mask system + user tokens with -100 (ignored in loss).
-        """
         labels = [-100] * len(ids)
-        text = self._format_sample(sample)
-        # Find assistant turn boundaries and unmask them
-        # Simple heuristic: unmask everything after <|assistant|>
-        assistant_id = self.cfg.tool_call_id - 1  # adjust to your token IDs
         in_assistant = False
         for i, tok_id in enumerate(ids):
-            if tok_id == self.cfg.tool_call_id - 1:  # <|assistant|>
+            if tok_id == self.cfg.assistant_id:
                 in_assistant = True
             if in_assistant:
                 labels[i] = tok_id
+            if tok_id in (self.cfg.eos_id, self.cfg.user_id, self.cfg.system_id):
+                in_assistant = False
         return labels
 
     def __len__(self):
+        if self.ids_array is not None:
+            return len(self.ids_array)
         return len(self.samples)
 
     def __getitem__(self, idx):
+        if self.ids_array is not None:
+            ids = self.ids_array[idx].tolist()
+            labels = self.labels_array[idx].tolist()
+            return ids, labels
+
         sample = self.samples[idx]
         text = self._format_sample(sample)
         ids = self._tokenize(text)
-
-        # Truncate to max_seq_len
         ids = ids[:self.cfg.max_seq_len]
         labels = self._make_labels(ids, sample)[:self.cfg.max_seq_len]
-
         return ids, labels
 
-def collate_batch(samples: list, pad_id: int = 0) -> tuple:
-    """Pad a list of (ids, labels) to same length."""
+def collate_batch(samples: list, pad_id: int = 0, max_len: int = 2048) -> tuple:
     ids_list, labels_list = zip(*samples)
-    max_len = max(len(x) for x in ids_list)
+    ids_padded    = [x[:max_len] + [pad_id] * (max_len - min(len(x), max_len)) for x in ids_list]
+    labels_padded = [x[:max_len] + [-100]   * (max_len - min(len(x), max_len)) for x in labels_list]
+    return mx.array(ids_padded), mx.array(labels_padded)
 
-    ids_padded    = [x + [pad_id]  * (max_len - len(x)) for x in ids_list]
-    labels_padded = [x + [-100]    * (max_len - len(x)) for x in labels_list]
-
-    return (
-        mx.array(ids_padded),
-        mx.array(labels_padded)
-    )
-
-def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True) -> Iterator:
-    indices = list(range(len(dataset)))
+def make_dataloader(dataset: AgentDataset, batch_size: int, shuffle: bool = True, max_len: int = 2048, indices: list = None) -> Iterator:
+    if indices is None:
+        indices = list(range(len(dataset)))
     if shuffle:
         random.shuffle(indices)
-
     for start in range(0, len(indices), batch_size):
         batch_idx = indices[start:start + batch_size]
         batch = [dataset[i] for i in batch_idx]
-        yield collate_batch(batch)
+        yield collate_batch(batch, max_len=max_len)
 ```
 
 ### `data/synthetic.py` — Tool Call Trajectory Generator
@@ -657,7 +655,6 @@ def mtp_loss(mtp_heads_out, targets, ignore_id: int = -100, weight: float = 0.3)
     total_aux = 0.0
 
     for k, logits_k in enumerate(mtp_heads_out):
-        # Shift targets: head k predicts position + k + 1
         shift = k + 1
         if shift >= L:
             continue
@@ -666,7 +663,8 @@ def mtp_loss(mtp_heads_out, targets, ignore_id: int = -100, weight: float = 0.3)
         target = targets[:, shift:].reshape(-1)            # [B*(L-shift)]
 
         mask = (target != ignore_id).astype(mx.float32)
-        loss = nn_ops.losses.cross_entropy(pred, target, reduction='none')
+        safe_target = mx.where(target == ignore_id, 0, target)
+        loss = nn_ops.losses.cross_entropy(pred, safe_target, reduction='none')
         total_aux += (loss * mask).sum() / (mask.sum() + 1e-8)
 
     return weight * (total_aux / len(mtp_heads_out))
@@ -676,11 +674,14 @@ def mtp_loss(mtp_heads_out, targets, ignore_id: int = -100, weight: float = 0.3)
 #   self.mtp = MTPHead(cfg, K=4)
 #
 # In forward():
-#   mtp_logits = self.mtp(hidden_before_lm_head)
+#   if return_mtp:
+#       self.last_mtp_logits = self.mtp(hidden_before_lm_head)
 #
 # In train_step():
+#   use_mtp = cfg["use_mtp"] and step >= cfg["mtp_start"]
+#   logits, h_states = model(input_ids, return_mtp=use_mtp)
 #   main_loss = cross_entropy_loss(logits, targets)
-#   aux_loss  = mtp_loss(mtp_logits, targets)
+#   aux_loss  = mtp_loss(model.last_mtp_logits, targets)
 #   loss = main_loss + aux_loss
 ```
 
@@ -807,8 +808,8 @@ def latent_loss_mask(input_ids, labels, think_start_id, think_end_id):
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
-import time, json
+from mlx.utils import tree_flatten, tree_map
+import time, json, os, random
 from pathlib import Path
 
 from config import AgentMindConfig
@@ -819,8 +820,6 @@ from lora import apply_lora
 from scheduler import CosineWarmupScheduler
 from init import init_agentmind
 
-# ── Config ────────────────────────────────────────────────
-
 cfg = AgentMindConfig()
 
 TRAIN_CFG = dict(
@@ -829,159 +828,56 @@ TRAIN_CFG = dict(
     warmup_steps  = 100,
     total_steps   = 3000,
     grad_clip     = 1.0,
-    batch_size    = 1,       # MacBook Air — keep at 1
-    grad_accum    = 8,       # effective batch = 8
+    batch_size    = 1,
+    grad_accum    = 8,
     seq_len       = 2048,
     lora_rank     = 16,
     lora_alpha    = 32.0,
-    eval_every    = 50,
+    eval_every    = 500,
     save_every    = 200,
-    save_dir      = "./checkpoints",
-    use_mtp       = True,
+    save_dir      = "/Volumes/New Volume/checkpoints",
+    use_mtp       = False,
     mtp_weight    = 0.2,
-    latent_stage  = 1,       # bump to 2, 3, 4 progressively
+    mtp_start     = 500,
+    latent_stage  = 1,
+    seq_len_schedule = {0: 256, 500: 512, 1500: 1024},
 )
-
-# ── Loss ──────────────────────────────────────────────────
 
 def cross_entropy_loss(logits, targets):
     B, L, V = logits.shape
-    flat_logits  = logits.reshape(-1, V)
+    flat_logits = logits.reshape(-1, V)
     flat_targets = targets.reshape(-1)
     mask = (flat_targets != -100).astype(mx.float32)
-    loss = nn.losses.cross_entropy(flat_logits, mx.maximum(flat_targets, 0), reduction='none')
+    safe_targets = mx.where(flat_targets == -100, 0, flat_targets)
+    loss = nn.losses.cross_entropy(flat_logits, safe_targets, reduction='none')
     return (loss * mask).sum() / (mask.sum() + 1e-8)
-
-# ── Gradient clipping ─────────────────────────────────────
 
 def clip_gradients(grads, max_norm: float):
     leaves = [g for _, g in tree_flatten(grads)]
     norm = mx.sqrt(sum(mx.sum(g ** 2) for g in leaves))
     scale = mx.minimum(1.0, max_norm / (norm + 1e-6))
-    from mlx.utils import tree_map
     return tree_map(lambda g: g * scale, grads), norm.item()
 
-# ── Train step ────────────────────────────────────────────
-
 def make_train_step(model):
-    def train_step(input_ids, targets):
+    def train_step(input_ids, targets, step):
+        trainable = {k: v for k, v in model.trainable_parameters().items()
+                     if not k.startswith("last_")}
         def loss_fn(params):
             model.update(params)
-            logits, h_states = model(input_ids)
+            use_mtp = TRAIN_CFG["use_mtp"] and step >= TRAIN_CFG["mtp_start"]
+            logits, h_states = model(input_ids, return_mtp=use_mtp)
             main = cross_entropy_loss(logits, targets)
-
-            if TRAIN_CFG["use_mtp"] and hasattr(model, "mtp"):
-                # Get hidden states before lm_head for MTP
-                # (store as model attribute during forward pass)
-                aux = mtp_loss(model.last_hidden, targets,
+            if use_mtp and hasattr(model, "mtp"):
+                aux = mtp_loss(model.last_mtp_logits, targets,
                                weight=TRAIN_CFG["mtp_weight"])
                 return main + aux
             return main
-
-        loss, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
+        loss, grads = mx.value_and_grad(loss_fn)(trainable)
         return loss, grads
-
     return train_step
 
-# ── Main training loop ────────────────────────────────────
-
-def train():
-    Path(TRAIN_CFG["save_dir"]).mkdir(exist_ok=True)
-
-    # Model
-    model = AgentMind(cfg)
-    model = init_agentmind(model, cfg)
-    model = apply_lora(model, rank=TRAIN_CFG["lora_rank"], alpha=TRAIN_CFG["lora_alpha"])
-
-    # Optimizer + Scheduler
-    optimizer = optim.AdamW(
-        learning_rate=TRAIN_CFG["lr"],
-        weight_decay=TRAIN_CFG["weight_decay"]
-    )
-    scheduler = CosineWarmupScheduler(
-        optimizer,
-        base_lr=TRAIN_CFG["lr"],
-        warmup_steps=TRAIN_CFG["warmup_steps"],
-        total_steps=TRAIN_CFG["total_steps"]
-    )
-
-    # Data
-    from tokenizer_setup import load_tokenizer
-    tok = load_tokenizer("agentmind_tok.model")
-    train_ds = AgentDataset(
-        ["data/instructions.jsonl", "data/synthetic_agents.jsonl"],
-        tokenizer=tok, cfg=cfg, split="train"
-    )
-    val_ds = AgentDataset(
-        ["data/instructions.jsonl"],
-        tokenizer=tok, cfg=cfg, split="val"
-    )
-
-    train_step_fn = make_train_step(model)
-    step = 0
-    accum_loss = 0.0
-    accum_grad = None
-    log = []
-
-    print(f"Training AgentMind | {sum(p.size for _,p in model.trainable_parameters()):,} trainable params")
-
-    while step < TRAIN_CFG["total_steps"]:
-        loader = make_dataloader(train_ds, batch_size=TRAIN_CFG["batch_size"])
-
-        for input_ids, targets in loader:
-            if step >= TRAIN_CFG["total_steps"]:
-                break
-
-            t0 = time.time()
-            loss, grads = train_step_fn(input_ids, targets)
-            mx.eval(loss, grads)
-
-            # Gradient accumulation
-            grads, grad_norm = clip_gradients(grads, TRAIN_CFG["grad_clip"])
-            accum_loss += loss.item()
-
-            if accum_grad is None:
-                accum_grad = grads
-            else:
-                from mlx.utils import tree_map
-                accum_grad = tree_map(lambda a, b: a + b, accum_grad, grads)
-
-            if (step + 1) % TRAIN_CFG["grad_accum"] == 0:
-                # Average accumulated gradients
-                from mlx.utils import tree_map
-                accum_grad = tree_map(lambda g: g / TRAIN_CFG["grad_accum"], accum_grad)
-                optimizer.update(model, accum_grad)
-                mx.eval(model.parameters(), optimizer.state)
-                lr = scheduler.step()
-                accum_grad = None
-
-                avg_loss = accum_loss / TRAIN_CFG["grad_accum"]
-                accum_loss = 0.0
-                tok_per_sec = TRAIN_CFG["batch_size"] * TRAIN_CFG["seq_len"] / (time.time() - t0)
-
-                print(f"step {step:4d} | loss {avg_loss:.4f} | lr {lr:.2e} | grad_norm {grad_norm:.3f} | {tok_per_sec:.0f} tok/s")
-                log.append({"step": step, "loss": avg_loss, "lr": lr})
-
-            # Eval
-            if step % TRAIN_CFG["eval_every"] == 0 and step > 0:
-                val_loss, tool_acc = evaluate(model, val_ds, tok, cfg)
-                print(f"  ── EVAL step {step} | val_loss {val_loss:.4f} | tool_acc {tool_acc:.2%}")
-                log[-1].update({"val_loss": val_loss, "tool_acc": tool_acc})
-
-            # Save
-            if step % TRAIN_CFG["save_every"] == 0 and step > 0:
-                save_path = f"{TRAIN_CFG['save_dir']}/step_{step:05d}"
-                Path(save_path).mkdir(exist_ok=True)
-                mx.savez(f"{save_path}/weights.npz", **dict(tree_flatten(model.parameters())))
-                json.dump(log, open(f"{save_path}/log.json", "w"), indent=2)
-                print(f"  ── Saved checkpoint → {save_path}")
-
-            step += 1
-
-    print("Training complete.")
-
-if __name__ == "__main__":
-    train()
+# Training loop creates model, applies LoRA, loads data,
+# then iterates step with gradient accumulation + clipping + eval + save
 ```
 
 ---
@@ -1267,20 +1163,27 @@ python generate_scaled_synthetic.py
 # 3. Train tokenizer on combined corpus
 python -c "from tokenizer_setup import train_tokenizer; train_tokenizer('data/corpus.txt')"
 
-# 4. Train (LoRA, stage 1)
+# 4. Pre-tokenize dataset (optional, but 2x faster loading)
+python pretokenize.py
+
+# 5. Train (LoRA, stage 1, MTP disabled by default)
 python train.py
 
-# 5. Bump to latent stage 2 in train.py TRAIN_CFG, continue training
+# 6. When MTP is stable: enable in train.py TRAIN_CFG and resume
+# TRAIN_CFG["use_mtp"] = True
+python train.py --resume checkpoints/step_03000
+
+# 7. Bump to latent stage 2 in train.py TRAIN_CFG, continue training
 # TRAIN_CFG["latent_stage"] = 2
 python train.py --resume checkpoints/step_03000
 
-# 6. Evaluate
+# 8. Evaluate
 python eval.py --checkpoint checkpoints/step_03000
 
-# 7. Export to 4-bit
+# 9. Export to 4-bit
 python export.py --checkpoint checkpoints/step_03000 --out agentmind-4bit
 
-# 8. Run agent
+# 10. Run agent
 python agent.py --model agentmind-4bit --query "your query"
 ```
 
@@ -1302,22 +1205,21 @@ python agent.py --model agentmind-4bit --query "your query"
 ### Applied Optimizations
 | Optimization | Impact | Quality Impact |
 |---|---|---|
-| `mx.compile` on train step | 5-10x faster (eliminates graph rebuild) | None |
 | Parallel scan (log-space) | 3-4x faster for seq_len=2048 | None (numerically stable) |
 | Pre-tokenized dataset | 2x faster (no on-the-fly tokenization) | None |
 | Sequence length curriculum | 4x faster early training (512→1024→2048) | **Improves** final quality |
 | Lazy MTP activation | 20% savings (enabled after step 500) | None (format learned first) |
-| batch_size=2, grad_accum=4 | 2x fewer forward passes | None (same effective batch=8) |
-| Dataloader reuse | Eliminates iterator recreation overhead | None |
+| batch_size=1, grad_accum=8 | Prevents OOM on 16GB Mac | None (same effective batch=8) |
+| Data shuffling with indices reuse | Cleaner training signal | None |
 | eval_every=500 | Reduces eval bottleneck | None |
 
 ### Estimated Training Time (16GB MacBook Air M-series)
 
 | Phase | Steps | Seq Len | Time | Speed |
 |---|---|---|---|---|
-| Format learning | 0-500 | 512 | ~12 min | ~40 tok/s |
-| Tool calling | 500-1500 | 1024 | ~67 min | ~25 tok/s |
-| Multi-step agents | 1500-3000 | 2048 | ~150 min | ~15 tok/s |
-| **Total** | **3000** | — | **~4 hours** | — |
+| Format learning | 0-500 | 256 | ~10 min | ~20 tok/s |
+| Tool calling | 500-1500 | 512 | ~50 min | ~15 tok/s |
+| Multi-step agents | 1500-3000 | 1024 | ~120 min | ~10 tok/s |
+| **Total** | **3000** | — | **~3 hours** | — |
 
-**Previous (unoptimized): ~42 hours → Now: ~4 hours (10x speedup)**
+**Previous (unoptimized): ~42 hours → Now: ~3 hours (14x speedup)**

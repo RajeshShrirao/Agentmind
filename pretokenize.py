@@ -36,6 +36,8 @@ def make_labels(ids: list[int], sample: dict) -> list[int]:
             in_assistant = True
         if in_assistant:
             labels[i] = tok_id
+        if tok_id == cfg.eos_id or tok_id == cfg.user_id or tok_id == cfg.system_id:
+            in_assistant = False
     return labels
 
 def pretokenize(data_files: list[str], max_len: int = 2048, split: str = "train"):

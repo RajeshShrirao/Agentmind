@@ -35,7 +35,7 @@ class AgentMind(nn.Module):
         # MTP auxiliary head
         self.mtp = MTPHead(cfg, K=4)
 
-    def __call__(self, input_ids):
+    def __call__(self, input_ids, return_mtp=False):
         # input_ids: [B, L]
         x = self.embed(input_ids)
         h_states = {}
@@ -47,11 +47,12 @@ class AgentMind(nn.Module):
             else:
                 x = block(x)
 
-        # Store last hidden state for MTP
+        # Store last hidden state for inference
         self.last_hidden = x
 
-        # MTP auxiliary predictions
-        self.last_mtp_logits = self.mtp(x)
+        # MTP auxiliary predictions (only when requested)
+        if return_mtp:
+            self.last_mtp_logits = self.mtp(x)
 
         x = self.norm(x)
         logits = self.lm_head(x)  # [B, L, vocab_size]

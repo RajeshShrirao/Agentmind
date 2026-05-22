@@ -2,15 +2,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import math
 
+
 class MambaBlock(nn.Module):
     """
     Selective State Space Model block.
-    
+
     At inference: pure O(1) recurrence — SSM state stays fixed size
     regardless of how many tool calls have been processed.
-    
-    At training: sequential scan (correct). Swap with parallel scan
-    for full training speed (see note at bottom).
+
+    At training: parallel scan (log-space) with numerical clipping.
+    log_contrib ∈ [-50, 50] prevents overflow in exp() that caused
+    0 × inf = NaN with d_state=16 and L ≥ 8.
     """
 
     def __init__(self, cfg):
@@ -74,54 +76,46 @@ class MambaBlock(nn.Module):
         # dB: [B, L, d_inner, d_state]
         dB = dt[:, :, :, None] * B_mat[:, :, None, :]
 
-        # Parallel scan (log-space for numerical stability)
+        # Parallel scan (log-space) with numerical stabilization
         # h_t = dA_t * h_{t-1} + dB_t * x_t
-        # In log space: log_h_t = log(dA_t) + log_h_{t-1} (prefix sum)
         log_dA = dt[:, :, :, None] * A[None, None]           # [B, L, d_inner, d_state]
-        # Clamp to prevent log(0) and numerical instability
         dBx = dB * x[:, :, :, None]
-        log_dBx = mx.log(mx.abs(dBx) + 1e-8)  # [B, L, d_inner, d_state]
+        log_dBx = mx.log(mx.abs(dBx) + 1e-8)
 
-        # Prefix sum of log_dA gives cumulative product
-        log_prefix = mx.cumsum(log_dA, axis=1)               # [B, L, d_inner, d_state]
+        # Prefix sum of log_dA
+        log_prefix = mx.cumsum(log_dA, axis=1)
 
-        # Each position's contribution: exp(log_prefix_total - log_prefix_local) * dBx
-        log_prefix_shifted = mx.concatenate([
-            mx.zeros_like(log_prefix[:, :1]),
-            log_prefix[:, :-1]
-        ], axis=1)
-
-        # Compute h via cumulative sum in linear space
-        # h_t = sum_{k=0}^{t} (prod_{j=k+1}^{t} dA_j) * dB_k * x_k
-        # = exp(log_prefix_t) * sum_{k=0}^{t} exp(log_dBx_k - log_prefix_k)
-        log_contrib = log_dBx - log_prefix                   # [B, L, d_inner, d_state]
-        contrib = mx.exp(log_contrib)                        # [B, L, d_inner, d_state]
-        h_cumsum = mx.cumsum(contrib, axis=1)                # [B, L, d_inner, d_state]
-        h = mx.exp(log_prefix) * h_cumsum                    # [B, L, d_inner, d_state]
+        # h = exp(log_prefix) * cumsum(exp(log_dBx - log_prefix))
+        # Clip log_contrib to prevent overflow of exp()
+        log_contrib = log_dBx - log_prefix
+        log_contrib_clipped = mx.clip(log_contrib, -50.0, 50.0)
+        contrib = mx.exp(log_contrib_clipped)
+        h_cumsum = mx.cumsum(contrib, axis=1)
+        h = mx.exp(log_prefix) * h_cumsum
 
         # Output: y = sum(h * C) + D * x
-        y = mx.sum(h * C_mat[:, :, None, :], axis=-1)        # [B, L, d_inner]
-        return y + x * self.D[None, None, :], h[:, -1]       # output, final state
+        y = mx.sum(h * C_mat[:, :, None, :], axis=-1)
+        return y + x * self.D[None, None, :], h[:, -1]
 
     def __call__(self, x, h_state=None):
         # x: [B, L, d_model]
         residual = x
-        x = self.norm(x)
+        x_normed = self.norm(x)
 
-        xz = self.in_proj(x)
+        xz = self.in_proj(x_normed)
         x_in, z = mx.split(xz, [self.d_inner], axis=-1)
 
         # Causal depthwise conv — trim padding to maintain causality
-        x_conv = self.conv(x_in)[:, :x_in.shape[1], :]
-        x_conv = nn.silu(x_conv)
+        x_conv_raw = self.conv(x_in)[:, :x_in.shape[1], :]
+        x_conv = nn.silu(x_conv_raw)
 
         # SSM + skip connection
-        y, h_out = self._ssm(x_conv)
+        y_ssm, h_out = self._ssm(x_conv)
 
         # Gate
-        y = y * nn.silu(z)
+        y_gated = y_ssm * nn.silu(z)
 
-        return self.out_proj(y) + residual, h_out
+        return self.out_proj(y_gated) + residual, h_out
 
     # ── Inference-only: single step recurrence ──────────────
     def step(self, x_t, h):

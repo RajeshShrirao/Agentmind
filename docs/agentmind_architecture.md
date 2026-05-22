@@ -9,7 +9,8 @@
 |---|---|---|
 | Training (LoRA) | Weights fp16 | ~1.2GB |
 | Training (LoRA) | LoRA params + optimizer | ~100MB |
-| Training (LoRA) | Activations (batch=1, seq=2048) | ~3GB |
+| Training (LoRA) | Activations (batch=1, seq=256-2048) | ~1.5-3GB |
+| Training (LoRA) | Parallel scan intermediates | ~2GB peak |
 | **Training total** | | **~5GB ✓** |
 | Inference (4-bit) | Weights GGUF | ~300MB |
 | Inference (4-bit) | SSM state (constant) | ~2MB |
@@ -77,14 +78,17 @@ class AgentMindConfig:
     # Special token IDs (assigned after tokenizer init)
     pad_id: int = 0
     bos_id: int = 1
-    eos_id: int = 2
-    tool_call_id: int = 3
-    plan_id: int = 4
-    memory_id: int = 5
-    scratch_id: int = 6
-    observe_id: int = 7
-    think_start_id: int = 8
-    think_end_id: int = 9
+    eos_id: int = 5
+    tool_call_id: int = 6
+    plan_id: int = 7
+    memory_id: int = 8
+    scratch_id: int = 9
+    observe_id: int = 10
+    think_start_id: int = 11
+    think_end_id: int = 12
+    system_id: int = 13
+    user_id: int = 14
+    assistant_id: int = 15
 
     @property
     def d_inner(self) -> int:
@@ -336,6 +340,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from .mamba_block import MambaBlock
 from .attention_block import LocalAttentionBlock
+from .mtp_head import MTPHead
 
 class AgentMind(nn.Module):
     """
@@ -365,8 +370,10 @@ class AgentMind(nn.Module):
         if cfg.tie_embeddings:
             self.lm_head.weight = self.embed.weight
 
-    def __call__(self, input_ids):
-        # input_ids: [B, L]
+        # MTP auxiliary head
+        self.mtp = MTPHead(cfg, K=4)
+
+    def __call__(self, input_ids, return_mtp=False):
         x = self.embed(input_ids)
         h_states = {}
 
@@ -377,9 +384,14 @@ class AgentMind(nn.Module):
             else:
                 x = block(x)
 
+        self.last_hidden = x
+        if return_mtp:
+            self.last_mtp_logits = self.mtp(x)
+
         x = self.norm(x)
-        logits = self.lm_head(x)  # [B, L, vocab_size]
+        logits = self.lm_head(x)
         return logits, h_states
+```
 
     def forward_with_state(self, input_ids, past_h_states=None):
         """Used during agentic inference to preserve SSM state across calls."""

@@ -10,9 +10,7 @@ import json
 import os
 import numpy as np
 from tokenizer_setup import load_tokenizer
-from config import AgentMindConfig
 
-cfg = AgentMindConfig()
 tok = load_tokenizer("agentmind_tok.model")
 
 def format_sample(sample: dict) -> str:
@@ -31,12 +29,16 @@ def format_sample(sample: dict) -> str:
 def make_labels(ids: list[int], sample: dict) -> list[int]:
     labels = [-100] * len(ids)
     in_assistant = False
+    assistant_id = tok.piece_to_id("<|assistant|>")
+    eos_id = tok.piece_to_id("<eos>")
+    user_id = tok.piece_to_id("<|user|>")
+    system_id = tok.piece_to_id("<|system|>")
     for i, tok_id in enumerate(ids):
-        if tok_id == cfg.assistant_id:
+        if tok_id == assistant_id:
             in_assistant = True
         if in_assistant:
             labels[i] = tok_id
-        if tok_id == cfg.eos_id or tok_id == cfg.user_id or tok_id == cfg.system_id:
+        if tok_id == eos_id or tok_id == user_id or tok_id == system_id:
             in_assistant = False
     return labels
 

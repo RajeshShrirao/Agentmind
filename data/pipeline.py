@@ -12,6 +12,7 @@ class AgentDataset:
         self.samples = []
         self.ids_array = None
         self.labels_array = None
+        self.latent_stage = 1
 
         if pretokenized:
             # Load pre-tokenized .npz files
@@ -48,13 +49,6 @@ class AgentDataset:
             "agent_multi":  0.25,
             "recovery":     0.15,
         }
-
-        random.shuffle(self.samples)
-        split_idx = int(len(self.samples) * 0.95)
-        if split == "train":
-            self.samples = self.samples[:split_idx]
-        else:
-            self.samples = self.samples[split_idx:]
 
     def _format_sample(self, sample: dict) -> str:
         """Convert message list to flat token string."""
@@ -100,7 +94,11 @@ class AgentDataset:
             labels = self.labels_array[idx].tolist()
             return ids, labels
 
-        sample = self.samples[idx]
+        import copy
+        from model.latent import inject_latent_tokens
+
+        sample = copy.deepcopy(self.samples[idx])
+        sample = inject_latent_tokens(sample, self.tok, self.latent_stage)
         text = self._format_sample(sample)
         ids = self._tokenize(text)
 

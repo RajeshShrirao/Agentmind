@@ -32,7 +32,7 @@ RECOVERY_SCHEMA = {
     "type": "recovery",
     "messages": [
         {"role": "user", "content": "Get stock price of NVDA"},
-        {"role": "assistant", "content": "<|tool_call|>{\"name\": \"get_stock\", \"args\": {\"ticker\": \"NVDA\"}}<|observe|>{\"error\": \"rate_limit\", \"retry_after\": 2}<|scratch|>Tool failed. Retry with backoff.<|tool_call|>{\"name\": \"get_stock\", \"args\": {\"ticker\": \"NVDA\", \"source\": \"backup\"}}<|observe|>{\"price\": 1024.5}NVDA is trading at $1024.50."}
+        {"role": "assistant", "content": "<|tool_call|>{\"name\": \"get_stock_price\", \"args\": {\"ticker\": \"NVDA\"}}<|observe|>{\"error\": \"rate_limit\", \"retry_after\": 2}<|scratch|>Tool failed. Retry with backoff.<|tool_call|>{\"name\": \"get_stock_price\", \"args\": {\"ticker\": \"NVDA\", \"source\": \"backup\"}}<|observe|>{\"price\": 1024.5}NVDA is trading at $1024.50."}
     ]
 }
 

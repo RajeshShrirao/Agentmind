@@ -30,11 +30,11 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
 
     Default targets — layers that matter most for agentic behavior:
       MambaBlock:         in_proj, out_proj
-      LocalAttentionBlock: q_proj, v_proj
+      LocalAttentionBlock: q_proj, v_proj, o_proj
       LM head
     """
     if targets is None:
-        targets = ["in_proj", "out_proj", "q_proj", "v_proj", "lm_head"]
+        targets = ["in_proj", "out_proj", "o_proj", "q_proj", "v_proj", "lm_head"]
 
     # Freeze entire model first
     model.freeze()

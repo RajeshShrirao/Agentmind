@@ -143,7 +143,12 @@ def generate_trajectory(n_steps: int = 3, inject_failure: bool = False) -> dict:
 
     for i, tool_name in enumerate(tools):
         tool = SYNTHETIC_TOOLS[tool_name]
-        mock_args = {k: f"example_{k}" for k in tool["args"].keys()}
+        mock_args = {}
+        for k, v in tool["args"].items():
+            if v is int:
+                mock_args[k] = random.randint(1, 100)
+            else:
+                mock_args[k] = f"example_{k}"
         call = json.dumps({"name": tool_name, "args": mock_args})
 
         if inject_failure and i == 0:
@@ -193,7 +198,12 @@ def generate_single_tool() -> dict:
     """Generate single tool call sample."""
     tool_name = random.choice(list(SYNTHETIC_TOOLS.keys()))
     tool = SYNTHETIC_TOOLS[tool_name]
-    mock_args = {k: f"example_{k}" for k in tool["args"].keys()}
+    mock_args = {}
+    for k, v in tool["args"].items():
+        if v is int:
+            mock_args[k] = random.randint(1, 100)
+        else:
+            mock_args[k] = f"example_{k}"
     call = json.dumps({"name": tool_name, "args": mock_args})
     result = json.dumps(tool["mock_result"](mock_args))
     

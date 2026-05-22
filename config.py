@@ -28,20 +28,20 @@ class AgentMindConfig:
     max_seq_len: int = 8192
     tie_embeddings: bool = True
 
-    # Special token IDs (assigned after tokenizer init)
-    pad_id: int = 0
-    bos_id: int = 1
-    eos_id: int = 5
-    tool_call_id: int = 6
-    plan_id: int = 7
-    memory_id: int = 8
-    scratch_id: int = 9
-    observe_id: int = 10
-    think_start_id: int = 11
-    think_end_id: int = 12
-    system_id: int = 13
-    user_id: int = 14
-    assistant_id: int = 15
+    # Special token IDs — set via hydrate_config() after tokenizer init
+    pad_id: int = -1
+    bos_id: int = -1
+    eos_id: int = -1
+    tool_call_id: int = -1
+    plan_id: int = -1
+    memory_id: int = -1
+    scratch_id: int = -1
+    observe_id: int = -1
+    think_start_id: int = -1
+    think_end_id: int = -1
+    system_id: int = -1
+    user_id: int = -1
+    assistant_id: int = -1
 
     def __post_init__(self):
         if self.dt_rank == -1:

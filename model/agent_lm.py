@@ -8,9 +8,9 @@ class AgentMind(nn.Module):
     """
     Hybrid SSM + Local Attention Language Model.
     
-    Layer pattern (n_layers=24, attn_every=4):
-    [M M M A | M M M A | M M M A | M M M A | M M M A | M M M A]
-     18 Mamba blocks + 6 Attention blocks = 24 total ≈ 600M params
+    Layer pattern (n_layers=16, attn_every=4):
+    [M M M A | M M M A | M M M A | M M M A]
+     12 Mamba blocks + 4 Attention blocks = 16 total ≈ 147M params
     """
 
     def __init__(self, cfg):

@@ -61,17 +61,19 @@ def evaluate_tool_calls(model, prompts: list[str], tok, cfg) -> list[dict]:
 def evaluate_tool_calls_from_text(model, prompts: list[str], tok, cfg) -> list[dict]:
     """
     Legacy-style: generate freeform text, then extract and validate tool calls.
-    Useful for comparison. Uses argmax (no temperature).
+    Maintains SSM state via forward_with_state for O(L) not O(L²).
+    Uses argmax (no temperature).
     """
     results = []
     for prompt in prompts:
         ids = mx.array([tok.encode(prompt, add_bos=True)])
+        h_states = {}
         output_ids = []
         for _ in range(200):
-            logits, _ = model(ids)
+            logits, h_states = model.forward_with_state(ids, h_states)
             next_tok = mx.argmax(logits[0, -1]).item()
             output_ids.append(next_tok)
-            ids = mx.concatenate([ids, mx.array([[next_tok]])], axis=1)
+            ids = mx.array([[next_tok]])
             if next_tok == cfg.eos_id:
                 break
         decoded = tok.decode(output_ids)
@@ -85,18 +87,19 @@ def evaluate_tool_calls_from_text(model, prompts: list[str], tok, cfg) -> list[d
 
 
 def format_adherence(model, prompts: list[str], tok, cfg) -> dict:
-    """Check structural output quality with greedy decoding."""
+    """Check structural output quality with greedy decoding. Maintains SSM state."""
     results = {"plan": 0, "scratch": 0, "eos": 0, "total": len(prompts)}
 
     for prompt in prompts:
         ids = mx.array([tok.encode(prompt, add_bos=True)])
+        h_states = {}
         output_ids = []
 
         for _ in range(300):
-            logits, _ = model(ids)
+            logits, h_states = model.forward_with_state(ids, h_states)
             next_tok = mx.argmax(logits[0, -1]).item()
             output_ids.append(next_tok)
-            ids = mx.concatenate([ids, mx.array([[next_tok]])], axis=1)
+            ids = mx.array([[next_tok]])
             if next_tok == cfg.eos_id:
                 results["eos"] += 1
                 break

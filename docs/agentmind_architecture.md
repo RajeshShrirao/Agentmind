@@ -21,7 +21,7 @@
 ## Architecture Overview
 
 ```
-AgentMind-330M
+AgentMind-147M
 ├── Embedding          [vocab=32k, d_model=1024]
 ├── 16 Hybrid Blocks
 │   ├── 0,1,2   → MambaBlock   (SSM, long-range memory)
@@ -32,7 +32,7 @@ AgentMind-330M
 ├── RMSNorm
 └── LM Head            [tied to embedding]
 
-~330M params · 3:1 Mamba-to-Attention ratio
+~147M params · 3:1 Mamba-to-Attention ratio
 ```
 
 **Why this ratio:**
@@ -75,20 +75,20 @@ class AgentMindConfig:
     max_seq_len: int = 8192
     tie_embeddings: bool = True
 
-    # Special token IDs (assigned after tokenizer init)
-    pad_id: int = 0
-    bos_id: int = 1
-    eos_id: int = 5
-    tool_call_id: int = 6
-    plan_id: int = 7
-    memory_id: int = 8
-    scratch_id: int = 9
-    observe_id: int = 10
-    think_start_id: int = 11
-    think_end_id: int = 12
-    system_id: int = 13
-    user_id: int = 14
-    assistant_id: int = 15
+    # Special token IDs — set via hydrate_config() after tokenizer init
+    pad_id: int = -1
+    bos_id: int = -1
+    eos_id: int = -1
+    tool_call_id: int = -1
+    plan_id: int = -1
+    memory_id: int = -1
+    scratch_id: int = -1
+    observe_id: int = -1
+    think_start_id: int = -1
+    think_end_id: int = -1
+    system_id: int = -1
+    user_id: int = -1
+    assistant_id: int = -1
 
     @property
     def d_inner(self) -> int:
@@ -124,9 +124,10 @@ class MambaBlock(nn.Module):
     At inference: pure O(1) recurrence — SSM state stays fixed size
     regardless of how many tool calls have been processed.
 
-    At training: parallel scan (log-space) with numerical clipping.
-    log_contrib ∈ [-50, 50] prevents overflow in exp() that caused
-    0 × inf = NaN with d_state=16 and L ≥ 8.
+    At training: compiled sequential scan — mathematically exact
+    sequential recurrence compiled by MLX for performance.
+    ~0.27s for 20 × seq_len=2048, identical to step() output
+    at machine epsilon precision.
     """
 
     def __init__(self, cfg):
@@ -463,9 +464,9 @@ class AgentMind(nn.Module):
     """
     Hybrid SSM + Local Attention Language Model.
     
-    Layer pattern (n_layers=24, attn_every=4):
-    [M M M A | M M M A | M M M A | M M M A | M M M A | M M M A]
-     18 Mamba blocks + 6 Attention blocks = 24 total ≈ 600M params
+    Layer pattern (n_layers=16, attn_every=4):
+    [M M M A | M M M A | M M M A | M M M A]
+     12 Mamba blocks + 4 Attention blocks = 16 total ≈ 147M params
     """
 
     def __init__(self, cfg):
@@ -508,7 +509,6 @@ class AgentMind(nn.Module):
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits, h_states
-```
 
     def forward_with_state(self, input_ids, past_h_states=None):
         """Used during agentic inference to preserve SSM state across calls."""
@@ -523,6 +523,9 @@ class AgentMind(nn.Module):
             else:
                 x = block(x)
 
+        self.last_hidden = x
+        self.last_mtp_logits = self.mtp(x)
+
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits, new_h_states
@@ -535,6 +538,7 @@ class AgentMind(nn.Module):
 ```python
 import sentencepiece as spm
 from pathlib import Path
+from dataclasses import dataclass
 
 SPECIAL_TOKENS = [
     "<pad>", "<bos>", "<eos>",
@@ -550,6 +554,93 @@ SPECIAL_TOKENS = [
     "<|system|>", "<|user|>", "<|assistant|>",
 ]
 
+@dataclass(frozen=True)
+class SpecialTokenIDs:
+    pad_id: int
+    bos_id: int
+    eos_id: int
+    unk_id: int
+    tool_call_id: int
+    plan_id: int
+    memory_id: int
+    scratch_id: int
+    observe_id: int
+    think_start_id: int
+    think_end_id: int
+    system_id: int
+    user_id: int
+    assistant_id: int
+
+def get_token_ids(tokenizer) -> SpecialTokenIDs:
+    return SpecialTokenIDs(
+        pad_id=tokenizer.pad_id(),
+        bos_id=tokenizer.bos_id(),
+        eos_id=tokenizer.piece_to_id("<eos>"),
+        unk_id=tokenizer.unk_id(),
+        tool_call_id=tokenizer.piece_to_id("<|tool_call|>"),
+        plan_id=tokenizer.piece_to_id("<|plan|>"),
+        memory_id=tokenizer.piece_to_id("<|memory|>"),
+        scratch_id=tokenizer.piece_to_id("<|scratch|>"),
+        observe_id=tokenizer.piece_to_id("<|observe|>"),
+        think_start_id=tokenizer.piece_to_id("<|think_start|>"),
+        think_end_id=tokenizer.piece_to_id("<|think_end|>"),
+        system_id=tokenizer.piece_to_id("<|system|>"),
+        user_id=tokenizer.piece_to_id("<|user|>"),
+        assistant_id=tokenizer.piece_to_id("<|assistant|>"),
+    )
+
+def assert_token_ids_real(tokenizer, ids: SpecialTokenIDs):
+    """Startup assertion — blocks training if token IDs are wrong."""
+    print("=" * 60)
+    print("Special Token ID Verification")
+    print("=" * 60)
+    fmt = "  {:25s} {}"
+    print(fmt.format("pad_id", ids.pad_id))
+    print(fmt.format("bos_id (<s>)", ids.bos_id))
+    print(fmt.format("eos_id (<eos>)", ids.eos_id))
+    print(fmt.format("spm_eos_id (</s>)", tokenizer.eos_id()))
+    print(fmt.format("unk_id", ids.unk_id))
+    print(fmt.format("tool_call_id", ids.tool_call_id))
+    print(fmt.format("plan_id", ids.plan_id))
+    print(fmt.format("memory_id", ids.memory_id))
+    print(fmt.format("scratch_id", ids.scratch_id))
+    print(fmt.format("observe_id", ids.observe_id))
+    print(fmt.format("think_start_id", ids.think_start_id))
+    print(fmt.format("think_end_id", ids.think_end_id))
+    print(fmt.format("system_id", ids.system_id))
+    print(fmt.format("user_id", ids.user_id))
+    print(fmt.format("assistant_id", ids.assistant_id))
+    all_ids = [ids.pad_id, ids.bos_id, ids.eos_id, ids.unk_id,
+               ids.tool_call_id, ids.plan_id, ids.memory_id, ids.scratch_id,
+               ids.observe_id, ids.think_start_id, ids.think_end_id,
+               ids.system_id, ids.user_id, ids.assistant_id]
+    assert len(set(all_ids)) == len(all_ids), \
+        f"Duplicate token IDs detected!"
+    assert ids.pad_id == tokenizer.pad_id()
+    assert ids.bos_id == tokenizer.bos_id()
+    assert ids.unk_id == tokenizer.unk_id()
+    assert all(t > 3 for t in all_ids[4:]), \
+        "Agentic control tokens must have IDs > 3"
+    print(f"✅ All {len(all_ids)} special token IDs are valid and unique.")
+    print("=" * 60)
+
+def hydrate_config(cfg, tokenizer):
+    """Set all cfg.*_id attributes from tokenizer-derived IDs."""
+    ids = get_token_ids(tokenizer)
+    for attr in ("pad_id", "bos_id", "eos_id", "tool_call_id", "plan_id",
+                 "memory_id", "scratch_id", "observe_id", "think_start_id",
+                 "think_end_id", "system_id", "user_id", "assistant_id"):
+        setattr(cfg, attr, getattr(ids, attr))
+    for attr in ("pad_id", "bos_id", "eos_id", "tool_call_id", "plan_id",
+                 "memory_id", "scratch_id", "observe_id", "think_start_id",
+                 "think_end_id", "system_id", "user_id", "assistant_id"):
+        assert getattr(cfg, attr) >= 0, \
+            f"hydrate_config failed: {attr} is still {getattr(cfg, attr)}"
+    assert cfg.eos_id == tokenizer.piece_to_id("<eos>")
+    assert cfg.tool_call_id == tokenizer.piece_to_id("<|tool_call|>")
+    assert cfg.assistant_id == tokenizer.piece_to_id("<|assistant|>")
+    return cfg
+
 def train_tokenizer(corpus_path: str, model_prefix: str = "agentmind_tok"):
     spm.SentencePieceTrainer.train(
         input=corpus_path,
@@ -558,13 +649,17 @@ def train_tokenizer(corpus_path: str, model_prefix: str = "agentmind_tok"):
         character_coverage=0.9999,
         model_type="bpe",
         pad_id=0,
+        pad_piece="<pad>",
         bos_id=1,
+        bos_piece="<s>",
         eos_id=2,
+        eos_piece="</s>",
         unk_id=3,
-        user_defined_symbols=SPECIAL_TOKENS[3:],  # custom tokens after <pad/bos/eos>
-        byte_fallback=True,             # handles any unicode
+        unk_piece="<unk>",
+        user_defined_symbols=SPECIAL_TOKENS[1:],
+        byte_fallback=True,
         add_dummy_prefix=False,
-        split_digits=True,              # tokenize digits separately (better for tool args)
+        split_digits=True,
     )
     print(f"Tokenizer saved: {model_prefix}.model")
 
@@ -584,40 +679,16 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 
-def cross_entropy_loss(logits, targets, ignore_id=0):
-    # logits: [B, L, V], targets: [B, L]
+def cross_entropy_loss(logits, targets):
+    # Shift logits and targets for next-token prediction
+    logits = logits[:, :-1, :]
+    targets = targets[:, 1:]
     B, L, V = logits.shape
-    logits_flat = logits.reshape(-1, V)
-    targets_flat = targets.reshape(-1)
-
-    loss = nn.losses.cross_entropy(logits_flat, targets_flat, reduction='none')
-    mask = (targets_flat != ignore_id).astype(mx.float32)
-    return (loss * mask).sum() / mask.sum()
-
-def make_lora_layers(model, rank=16, alpha=32):
-    """
-    Freeze everything. LoRA-inject only:
-    - MambaBlock.in_proj, out_proj
-    - LocalAttentionBlock.q_proj, v_proj
-    - LM head
-    """
-    frozen = set()
-    lora = set()
-
-    for name, module in tree_flatten(model.trainable_parameters()):
-        if any(k in name for k in ['in_proj', 'out_proj', 'q_proj', 'v_proj', 'lm_head']):
-            lora.add(name)
-        else:
-            frozen.add(name)
-
-    # Freeze
-    model.freeze()
-    # Unfreeze LoRA targets
-    for name in lora:
-        # In practice: wrap with LoRA adapter using mlx-lm's LoRALinear
-        pass
-
-    return model
+    flat_logits  = logits.reshape(-1, V)
+    flat_targets = targets.reshape(-1)
+    mask = (flat_targets != -100).astype(mx.float32)
+    loss = nn.losses.cross_entropy(flat_logits, mx.maximum(flat_targets, 0), reduction='none')
+    return (loss * mask).sum() / (mask.sum() + 1e-8)
 
 class TrainConfig:
     # Optimizer

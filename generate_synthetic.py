@@ -24,6 +24,10 @@ TOOLS = [
     {"name": "execute_sql", "args": {"query": "SELECT COUNT(*) FROM users"}},
     {"name": "send_email", "args": {"to": "team@company.com", "subject": "Update", "body": "Progress report..."}},
     {"name": "git_commit", "args": {"message": "fix: resolve memory leak in data pipeline"}},
+    {"name": "list_directory", "args": {"path": "/src"}},
+    {"name": "get_stock_price", "args": {"ticker": "AAPL"}},
+    {"name": "translate", "args": {"text": "Hello world", "target_lang": "es"}},
+    {"name": "summarize", "args": {"text": "Long article text..."}},
 ]
 
 USER_QUERIES = [
@@ -74,7 +78,11 @@ def generate_single_tool():
         "fetch_abstract": {"abstract": "We present Mamba, a selective state space model that achieves..."},
         "execute_sql": {"rows": [{"COUNT(*)": 1542}]},
         "send_email": {"success": True, "message_id": "msg_abc123"},
-        "git_commit": {"success": True, "commit_hash": "a1b2c3d"}
+        "git_commit": {"success": True, "commit_hash": "a1b2c3d"},
+        "list_directory": {"files": ["main.py", "utils.py", "config.py"]},
+        "get_stock_price": {"price": 189.50, "change": "+2.3%"},
+        "translate": {"translated": "Hola mundo"},
+        "summarize": {"summary": "Key points: 1... 2... 3..."}
     }
     result = results.get(tool["name"], {"status": "ok"})
     observe = json.dumps(result)
@@ -144,7 +152,7 @@ Rules:
 - For tool calls, use format: <|tool_call|>{"name": "tool_name", "args": {...}}<|observe|>{"result": "..."}
 - For multi-step, include <|plan|> at start
 - For recovery, include <|scratch|> for reasoning
-- Available tools: web_search, read_file, write_file, run_python, get_weather, search_arxiv, fetch_abstract, execute_sql
+- Available tools: web_search, read_file, write_file, run_python, get_weather, search_arxiv, fetch_abstract, execute_sql, send_email, git_commit, list_directory, get_stock_price, translate, summarize
 - Make queries realistic and varied
 - Output ONLY valid JSON array, no markdown, no explanation"""
 

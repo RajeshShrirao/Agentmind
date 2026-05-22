@@ -14,7 +14,6 @@ agentmind/
 │   └── formats.py           # JSONL schema definitions
 ├── model/
 │   ├── rope.py              # RoPE for attention blocks
-│   ├── conv_state.py        # conv buffer for single-step inference
 │   ├── mtp_head.py          # Multi-Token Prediction auxiliary head
 │   └── latent.py            # think_start / think_end training logic
 ├── lora.py                  # LoRALinear + model wrapping
@@ -52,7 +51,7 @@ AgentMind uses a **multi-source data strategy** combining open datasets, curated
 **Total synthetic: 13,203 samples** across 5 types with 14 tools in registry.
 
 #### Special Tokens in Data
-All special tokens (`<|tool_call|>`, `<|observe|>`, `<|plan|>`, `<|scratch|>`, `<|think_start|>`, `<|think_end|>`) are present in both the corpus and synthetic data. Token IDs: pad=0, bos=1, eos=5, tool_call=6, plan=7, memory=8, scratch=9, observe=10, think_start=11, think_end=12, system=13, user=14, assistant=15.
+All special tokens (`<|tool_call|>`, `<|observe|>`, `<|plan|>`, `<|scratch|>`, `<|think_start|>`, `<|think_end|>`) are present in both the corpus and synthetic data. Token IDs are derived from the tokenizer at runtime via `hydrate_config()` — pad=0, bos=1, eos=2, unk=3, all agentic control tokens occupy positions ~31987–31999.
 
 ### `data/formats.py` — JSONL Schema
 
@@ -92,7 +91,7 @@ Every training sample is one of **five** types. All share the same JSONL line fo
     "type": "recovery",
     "messages": [
         {"role": "user", "content": "Get stock price of NVDA"},
-        {"role": "assistant", "content": "<|tool_call|>{\"name\": \"get_stock\", \"args\": {\"ticker\": \"NVDA\"}}<|observe|>{\"error\": \"rate_limit\", \"retry_after\": 2}<|scratch|>Tool failed. Retry with backoff.<|tool_call|>{\"name\": \"get_stock\", \"args\": {\"ticker\": \"NVDA\", \"source\": \"backup\"}}<|observe|>{\"price\": 1024.5}NVDA is trading at $1024.50."}
+        {"role": "assistant", "content": "<|tool_call|>{\"name\": \"get_stock_price\", \"args\": {\"ticker\": \"NVDA\"}}<|observe|>{\"error\": \"rate_limit\", \"retry_after\": 2}<|scratch|>Tool failed. Retry with backoff.<|tool_call|>{\"name\": \"get_stock_price\", \"args\": {\"ticker\": \"NVDA\", \"source\": \"backup\"}}<|observe|>{\"price\": 1024.5}NVDA is trading at $1024.50."}
     ]
 }
 
@@ -267,7 +266,10 @@ def generate_trajectory(n_steps: int = 3, inject_failure: bool = False) -> dict:
     for i, tool_name in enumerate(tools):
         tool = SYNTHETIC_TOOLS[tool_name]
         # Generate mock args
-        mock_args = {k: f"example_{k}" for k in tool["args"].keys()}
+        mock_args = {
+            k: (random.randint(1, 100) if v is int else f"example_{k}")
+            for k, v in tool["args"].items()
+        }
         call = json.dumps({"name": tool_name, "args": mock_args})
 
         if inject_failure and i == 0:
@@ -479,7 +481,7 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
       LM head
     """
     if targets is None:
-        targets = ["in_proj", "out_proj", "q_proj", "v_proj", "lm_head"]
+        targets = ["in_proj", "out_proj", "o_proj", "q_proj", "v_proj", "lm_head"]
 
     # Freeze entire model first
     model.freeze()
@@ -507,62 +509,7 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
 
 ---
 
-## 5. Conv State for Single-Step Inference
-
-### `model/conv_state.py`
-
-```python
-import mlx.core as mx
-
-class ConvState:
-    """
-    Manages the sliding conv buffer for Mamba's causal depthwise conv
-    during single-token (autoregressive) inference.
-
-    At training: process full sequence with padding.
-    At inference: slide a d_conv-length buffer per token.
-    """
-
-    def __init__(self, batch_size: int, d_inner: int, d_conv: int):
-        # Buffer: last (d_conv - 1) input vectors
-        self.buf = mx.zeros((batch_size, d_conv - 1, d_inner))
-        self.d_conv = d_conv
-
-    def step(self, x_t, conv_weight, conv_bias):
-        """
-        x_t:        [B, d_inner] — current token's inner representation
-        conv_weight: [d_inner, d_conv] — depthwise conv weights
-        conv_bias:   [d_inner]
-        Returns:    [B, d_inner] — conv output for this timestep
-        """
-        # Append current token to buffer
-        x_t_expanded = x_t[:, None, :]                  # [B, 1, d_inner]
-        window = mx.concatenate([self.buf, x_t_expanded], axis=1)  # [B, d_conv, d_inner]
-
-        # Depthwise conv: dot each channel independently
-        # conv_weight: [d_inner, d_conv]
-        out = mx.sum(window * conv_weight[None, :, :].transpose(0, 2, 1), axis=1)
-        out = out + conv_bias[None, :]                   # [B, d_inner]
-
-        # Slide buffer: drop oldest, keep last (d_conv - 1)
-        self.buf = window[:, 1:, :]
-        return out
-
-# ── How to use in MambaBlock.step() ──────────────────────
-#
-# At inference init:
-#   conv_states = {i: ConvState(B, cfg.d_inner, cfg.d_conv)
-#                  for i, block in enumerate(model.blocks)
-#                  if isinstance(block, MambaBlock)}
-#
-# Per token step:
-#   x_conv = conv_states[i].step(x_t, block.conv.weight, block.conv.bias)
-#   x_conv = nn.silu(x_conv)
-```
-
----
-
-## 6. LR Scheduler
+## 5. LR Scheduler
 
 ### `scheduler.py`
 
@@ -613,7 +560,7 @@ class CosineWarmupScheduler:
 
 ---
 
-## 7. MTP — Multi-Token Prediction
+## 6. MTP — Multi-Token Prediction
 
 ### `model/mtp_head.py`
 
@@ -690,7 +637,7 @@ def mtp_loss(mtp_heads_out, targets, ignore_id: int = -100, weight: float = 0.3)
 
 ---
 
-## 8. Latent Reasoning Training
+## 7. Latent Reasoning Training
 
 ### `model/latent.py`
 
@@ -746,42 +693,6 @@ def inject_latent_tokens(sample: dict, tokenizer, stage: int) -> dict:
 
     return sample
 
-class LatentReasoningWrapper(nn.Module):
-    """
-    Wraps a MambaBlock to execute N silent recurrence steps
-    when <|think_start|> token is detected.
-
-    At <|think_start|>: enter latent mode
-    For N steps: update hidden state without emitting tokens
-    At <|think_end|>: resume normal generation
-    """
-
-    def __init__(self, mamba_block, cfg, n_steps: int = N_LATENT_STEPS):
-        super().__init__()
-        self.block = mamba_block
-        self.n_steps = n_steps
-        self.think_start_id = cfg.think_start_id
-        self.think_end_id   = cfg.think_end_id
-
-    def latent_forward(self, hidden, h_state):
-        """
-        Execute N silent SSM recurrence steps.
-        No tokens emitted. Hidden state accumulates reasoning.
-        """
-        for _ in range(self.n_steps):
-            # Feed last hidden state back as input (no decode step)
-            hidden, h_state = self.block(hidden, h_state)
-        return hidden, h_state
-
-    def __call__(self, x, input_ids=None, h_state=None):
-        if input_ids is not None:
-            # Check if any token in this batch is think_start
-            has_think = mx.any(input_ids == self.think_start_id)
-            if has_think:
-                x, h_state = self.latent_forward(x, h_state)
-
-        return self.block(x, h_state)
-
 def latent_loss_mask(input_ids, labels, think_start_id, think_end_id):
     """
     During latent stages, zero out loss between think_start and think_end.
@@ -803,7 +714,7 @@ def latent_loss_mask(input_ids, labels, think_start_id, think_end_id):
 
 ---
 
-## 9. Complete Training Loop
+## 8. Complete Training Loop
 
 ### `train.py`
 
@@ -885,7 +796,7 @@ def make_train_step(model):
 
 ---
 
-## 10. Evaluation
+## 9. Evaluation
 
 ### `eval.py`
 
@@ -919,6 +830,7 @@ def compute_perplexity(model, dataset, tok, cfg, max_batches: int = 50) -> float
 def tool_call_accuracy(model, prompts: list[str], tok, cfg) -> float:
     """
     Check if model reliably produces valid JSON after <|tool_call|>.
+    Maintains SSM state via forward_with_state for O(L) not O(L²).
     A structurally valid JSON tool call = pass.
     """
     passed = 0
@@ -926,11 +838,12 @@ def tool_call_accuracy(model, prompts: list[str], tok, cfg) -> float:
 
     for prompt in prompts:
         ids = mx.array([tok.encode(prompt, add_bos=True)])
+        h_states = {}
         output_ids = []
 
         # Generate up to 200 tokens
         for _ in range(200):
-            logits, _ = model(ids)
+            logits, h_states = model.forward_with_state(ids, h_states)
             next_tok = mx.argmax(logits[0, -1]).item()
             output_ids.append(next_tok)
             ids = mx.array([[next_tok]])
@@ -957,15 +870,17 @@ def format_adherence(model, prompts: list[str], tok, cfg) -> dict:
     - Does it use <|plan|> for multi-step queries?
     - Does it use <|scratch|> for intermediate reasoning?
     - Does it terminate with EOS?
+    Maintains SSM state via forward_with_state.
     """
     results = {"plan": 0, "scratch": 0, "eos": 0, "total": len(prompts)}
 
     for prompt in prompts:
         ids = mx.array([tok.encode(prompt, add_bos=True)])
+        h_states = {}
         output_ids = []
 
         for _ in range(300):
-            logits, _ = model(ids)
+            logits, h_states = model.forward_with_state(ids, h_states)
             next_tok = mx.argmax(logits[0, -1]).item()
             output_ids.append(next_tok)
             ids = mx.array([[next_tok]])
@@ -998,7 +913,7 @@ def evaluate(model, val_dataset, tok, cfg):
 
 ---
 
-## 11. GGUF Export
+## 10. GGUF Export
 
 ### `export.py`
 
@@ -1109,48 +1024,13 @@ if __name__ == "__main__":
 
 ---
 
-## 12. Parallel Scan (Training Speed Upgrade)
+## 11. SSM Scan Strategy
 
-```python
-# model/parallel_scan.py
-# Drop-in replacement for the sequential loop in MambaBlock._ssm()
-# Reduces training time from O(L) sequential steps → O(log L) parallel steps
+The SSM recurrence `h_t = dA_t * h_{t-1} + dBx_t` must be computed over the full sequence during training.
 
-import mlx.core as mx
+**Compiled sequential scan (current):** A for-loop over `L` steps, wrapped in `mx.compile` for MLX JIT optimization. Runs ~0.27s for 20 iterations of seq_len=2048. Mathematically identical to the inference `step()` path — verified at machine epsilon precision (max diff 2.38e-7).
 
-def parallel_scan_log(log_coeffs, log_values):
-    """
-    Log-space parallel scan for numerical stability.
-    Computes: h_t = prod(a_1..a_t) * h_0 + sum_k( prod(a_{k+1}..a_t) * b_k )
-
-    log_coeffs: [B, L, d_inner, d_state] — log of dA
-    log_values:  [B, L, d_inner, d_state] — log of dB * x
-    """
-    # Prefix sum in log space = cumulative product in linear space
-    log_prefix = mx.cumsum(log_coeffs, axis=1)
-
-    # Each position's contribution: value * (total_prefix / local_prefix)
-    # = value * exp(log_prefix_total - log_prefix_local)
-    log_prefix_shifted = mx.concatenate([
-        mx.zeros_like(log_prefix[:, :1]),
-        log_prefix[:, :-1]
-    ], axis=1)
-
-    # Numerically stable sum using log-sum-exp
-    log_h = log_prefix_shifted + log_values
-    # Scan via cumulative log-sum-exp
-    h = mx.cumsum(mx.exp(log_h - log_prefix), axis=1) * mx.exp(log_prefix)
-    return h
-
-# ── Swap into MambaBlock._ssm() ──────────────────────────
-# Replace the for-loop with:
-#
-#   log_dA = dt[:,:,:,None] * A[None, None]           # [B,L,di,ds]
-#   log_dB = mx.log(mx.abs(dB) + 1e-8)               # [B,L,di,ds]
-#   log_x  = mx.log(mx.abs(x[:,:,:,None]) + 1e-8)    # [B,L,di,1]
-#   h = parallel_scan_log(log_dA, log_dB + log_x)
-#   y = mx.sum(h * C_mat[:,:,None,:], axis=-1)
-```
+**Log-space parallel scan (previous):** Attempted O(log L) parallel scan via cumulative sums in log-space. Replaced because `exp(large_negative)` underflows to 0, producing `0 × inf = NaN` when these zeros multiply against unbounded values. For selective SSMs (input-dependent dt), the recurrence coefficients vary per timestep, so parallel prefix scans require careful numerical management. The compiled sequential scan avoids these issues entirely while maintaining adequate training speed.
 
 ---
 
@@ -1208,7 +1088,7 @@ python agent.py --model agentmind-4bit --query "your query"
 ### Applied Optimizations
 | Optimization | Impact | Quality Impact |
 |---|---|---|
-| Parallel scan (log-space) | 3-4x faster for seq_len=2048 | None (numerically stable) |
+| Compiled sequential scan | ~0.27s / 20×seq_len=2048 | Exact mathematical parity (2.38e-7 max diff) |
 | Pre-tokenized dataset | 2x faster (no on-the-fly tokenization) | None |
 | Sequence length curriculum | 4x faster early training (512→1024→2048) | **Improves** final quality |
 | Lazy MTP activation | 20% savings (enabled after step 500) | None (format learned first) |

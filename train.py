@@ -286,6 +286,14 @@ def evaluate(model, val_ds, tok, cfg, max_len=None):
 def train():
     Path(TRAIN_CFG["save_dir"]).mkdir(exist_ok=True)
 
+    # Tokenizer — load first so we can derive real token IDs
+    from tokenizer_setup import load_tokenizer, get_token_ids, assert_token_ids_real, hydrate_config
+    tok = load_tokenizer("agentmind_tok.model")
+    ids = get_token_ids(tok)
+    assert_token_ids_real(tok, ids)
+    hydrate_config(cfg, tok)
+    print("Config token IDs hydrated from tokenizer.\n")
+
     # Model
     model = AgentMind(cfg)
     model = init_agentmind(model, cfg)
@@ -304,12 +312,19 @@ def train():
     )
 
     # Data
-    from tokenizer_setup import load_tokenizer
-    tok = load_tokenizer("agentmind_tok.model")
-
+    # Note: tokenizer already loaded at top of train()
     # Use pre-tokenized data if available, otherwise use raw JSONL
-    # Force bypass loading of pre-tokenized .npz files so dynamic latent injection runs
-    if False and os.path.exists("data/train_ids.npz") and os.path.exists("data/train_labels.npz"):
+    # Pre-tokenized path is only safe after Phase 0-1 (correct label IDs).
+    # Dynamic latent injection still runs on tokenized IDs via latent_loss_mask.
+    #
+    # History: The pre-tokenized bypass was originally `if False and os.path.exists(...)`
+    # to prevent using pre-tokenized data that encoded labels with wrong hardcoded
+    # token IDs (e.g. assistant_id=15 vs actual ~31999). Using that data would have
+    # silently masked the problem. Now that Phase 0-1 fixed label encoding via
+    # hydrate_config(), pre-tokenized data must be REGENERATED (run pretokenize.py)
+    # before this path will activate. Conditions for re-enabling: (1) regenerate .npz
+    # files with correct token IDs, (2) verify label masks via test_token_ids.py.
+    if os.path.exists("data/train_ids.npz") and os.path.exists("data/train_labels.npz"):
         train_ds = AgentDataset(
             ["data/train_ids.npz", "data/train_labels.npz"],
             cfg=cfg, split="train", pretokenized=True

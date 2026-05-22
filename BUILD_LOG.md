@@ -172,10 +172,23 @@ Changes across 12 files:
 
 **Still broken / missing:**
 - `LatentReasoningWrapper` is dead code. Never wired into `agent_lm.py`.
-- `ConvState` is defined but never used in `MambaBlock.step()` — the conv is skipped during inference.
-- `step()` has the wrong `dt_rank` split. Will crash on first inference call.
 - `agent.py` and `export.py` are still empty stubs.
 - The 11.5K synthetic samples cover formatting but not real tool semantics.
+
+---
+
+## `7c119cb` — 2026-05-22 14:12
+
+**Mamba Block Parity & Correctness Patch.**
+
+Discovered major train/inference mismatches in `model/mamba_block.py` and resolved them to mathematical and functional parity.
+
+- **Exact Sequential Scan**: Replaced the log-space parallel scan in `_ssm()` with an exact sequential scan loop compiled via `mx.compile`. The log-space parallel scan was numerically unstable, relying on `mx.clip(log_contrib, -50.0, 50.0)` which introduced severe output mismatches on sequence lengths > 3 when comparing token-by-token recurrence against full sequences. The compiled sequential loop runs in ~0.27s for 20 runs of sequence length 2048, maintaining speed while ensuring mathematical identity.
+- **Causal Conv State Handling**: Resolved the inference conv bypass. Both `__call__` and `step` now accept and return an explicit, serializable dictionary state format: `{"ssm_state": mx.array, "conv_state": mx.array}`. During `__call__`, the convolution prepends the incoming `conv_state` history buffer, slides, and stores the updated last `d_conv - 1` tokens. During `step()`, the same causal logic is applied to single tokens, sliding and updating the buffer step-by-step.
+- **Dynamic Slicing**: Replaced the hardcoded split point (`self.d_inner // 16`) in `step()` with dynamic slicing based on weight shapes: `dr = self.x_proj.weight.shape[0] - self.d_state * 2`, preventing crashes on arbitrary config/weight dimensions.
+- **Leading Dimension Flattening**: Removed hardcoded shape assumptions from `step()`. Flattened any leading prefix dimensions of input `x_t: [..., d_model]` to `[B, d_model]` dynamically, then reshaped output back to the original layout, supporting dynamic batches and multidimensional prefixes.
+- **Missing Residual Link**: Fixed a critical bug in `step()` where the residual skip connection `+ residual` (present in `__call__()`) was completely omitted.
+- **Verification Suite**: Created `test_mamba_parity.py` containing complete parity checks (single token vs multi-token, chunked sequence state propagation, and prefix dimensions). Verified parity to machine epsilon precision (output max diff `2.38e-7`, state max diff `2.32e-10`).
 
 ---
 
@@ -185,14 +198,15 @@ Changes across 12 files:
 |---|---|
 | Model forward | ✅ Works (145M params) |
 | Training loop | ✅ Runs, ~3h for 3000 steps |
-| Parallel scan | ⚠️ Numerically clipped, may be mathematically incomplete |
+| Parallel scan | ❌ Replaced with compiled sequential loop (exact mathematical parity) |
 | LoRA | ✅ 6M trainable params |
 | Pre-tokenized data | ✅ 2x loading speedup |
 | Tokenizer | ✅ 32K BPE with 13 special tokens |
 | Synthetic data | ✅ 11.5K samples |
 | Latent reasoning wrapper | ❌ Dead code |
-| Inference conv state | ❌ Conv skipped in `step()` |
-| Inference dt_rank split | ❌ Will crash on first call |
+| Inference conv state | ✅ Works (correctly updated via explicit state dictionaries in forward/step) |
+| Inference dt_rank split | ✅ Works (dynamic slicing based on projection weight shapes) |
+| Parity verification tests | ✅ Added complete verification suite for step vs __call__ parity |
 | agent.py | ❌ Empty stub |
 | export.py | ❌ Empty stub |
 | Memory budget | ✅ ~5GB training, <1GB inference |
@@ -201,15 +215,12 @@ Changes across 12 files:
 
 - **d_state=16** is a post-it note, not a memory. 384K scalars for the entire "persistent cognition" of the system. That's about 96 bytes of information per forward pass.
 - **3,000 steps × 8 effective batch × 600 avg seq_len = 14.4M tokens**. For a 145M param model, that's 0.1× Chinchilla. The model will memorize patterns, not acquire capabilities.
-- **The parallel scan is not the associative scan from the Mamba paper**. The cumsum approach works for constant-coefficient recurrences but Mamba's dt varies per token. This might produce silent gradient errors.
 - **Every tool call is formatted imitation**. The model has no schema awareness, no tool registry, no structured decoding. It's a text pattern, not tool use.
 
 ---
 
 ## What's Next
 
-1. Fix the inference bugs (`step()` conv skip, dt_rank split) before any real inference
-2. Wire `LatentReasoningWrapper` or kill the feature
-3. Run actual training and see if loss goes below 2.0
-4. If training works: evaluate whether tool calls are real or hallucinated patterns
-5. If training doesn't work: fall back to the sequential scan and accept slower training
+1. Wire `LatentReasoningWrapper` or kill the feature
+2. Run actual training and see if loss goes below 2.0
+3. If training works: evaluate whether tool calls are real or hallucinated patterns

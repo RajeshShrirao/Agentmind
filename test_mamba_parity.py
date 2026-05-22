@@ -122,5 +122,33 @@ def test_mamba_parity():
 
     print("\nALL tests passed successfully! Parity and state serialization verified.")
 
+def test_real_config_shape_consistency():
+    print("\n================ Testing Shape Consistency with Real Config ================")
+    cfg = AgentMindConfig()  # Uses full scale parameters: d_model=1024, d_inner=2048, d_state=16, d_conv=4, dt_rank=-1 (resolved to 64)
+    cfg.debug = True
+    
+    block = MambaBlock(cfg)
+    
+    B, L = 2, 8
+    x = mx.random.normal((B, L, cfg.d_model))
+    
+    # 1. Training (forward/call) pass
+    print("Running training forward pass with real config...")
+    out_call, state = block(x)
+    assert out_call.shape == (B, L, cfg.d_model), f"Expected out_call shape {(B, L, cfg.d_model)}, got {out_call.shape}"
+    assert state["ssm_state"].shape == (B, cfg.d_inner, cfg.d_state)
+    assert state["conv_state"].shape == (B, cfg.d_conv - 1, cfg.d_inner)
+    
+    # 2. Inference (step) pass
+    print("Running single-step inference pass with real config...")
+    token_in = x[:, 0, :]
+    out_step, new_state = block.step(token_in, None)
+    assert out_step.shape == token_in.shape, f"Expected out_step shape {token_in.shape}, got {out_step.shape}"
+    assert new_state["ssm_state"].shape == (B, cfg.d_inner, cfg.d_state)
+    assert new_state["conv_state"].shape == (B, cfg.d_conv - 1, cfg.d_inner)
+    
+    print("Real config shape consistency test passed successfully!")
+
 if __name__ == "__main__":
     test_mamba_parity()
+    test_real_config_shape_consistency()

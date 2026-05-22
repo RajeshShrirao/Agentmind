@@ -20,11 +20,13 @@ class MambaBlock(nn.Module):
         d = cfg.d_model
         di = cfg.d_inner
         ds = cfg.d_state
-        dr = cfg.dt_rank_val
+        dr = cfg.dt_rank
 
         self.d_inner = di
         self.d_state = ds
         self.d_conv = cfg.d_conv
+        self.dt_rank = dr
+        self.debug = getattr(cfg, "debug", True)
 
         # Pre-norm
         self.norm = nn.RMSNorm(d)
@@ -59,15 +61,31 @@ class MambaBlock(nn.Module):
     def _ssm(self, x, h_init=None):
         # x: [B, L, d_inner]
         B, L, _ = x.shape
-        dr, ds = self.x_proj.weight.shape[0] - self.d_state * 2, self.d_state
+
+        if self.debug:
+            assert x.ndim == 3, f"Expected 3D tensor [B, L, d_inner], got {x.shape}"
+            assert x.shape[-1] == self.d_inner, f"Expected last dimension to be {self.d_inner}, got {x.shape[-1]}"
+            assert h_init is None or h_init.shape == (B, self.d_inner, self.d_state), \
+                f"Expected h_init shape {(B, self.d_inner, self.d_state)}, got {h_init.shape}"
 
         A = -mx.exp(self.A_log)                    # [d_inner, d_state]
 
         # Project to dt, B_mat, C_mat
-        xbc = self.x_proj(x)                       # [B, L, dr + 2*ds]
+        xbc = self.x_proj(x)                       # [B, L, dt_rank + 2*d_state]
+
+        if self.debug:
+            assert xbc.shape[-1] == self.dt_rank + 2 * self.d_state, \
+                f"Expected xbc last dimension to be {self.dt_rank + 2 * self.d_state}, got {xbc.shape[-1]}"
+
         dt_raw, B_mat, C_mat = mx.split(
-            xbc, [dr, dr + ds], axis=-1
+            xbc, [self.dt_rank, self.dt_rank + self.d_state], axis=-1
         )
+
+        if self.debug:
+            assert dt_raw.shape[-1] == self.dt_rank, f"Expected dt_raw shape to end in {self.dt_rank}, got {dt_raw.shape}"
+            assert B_mat.shape[-1] == self.d_state, f"Expected B_mat shape to end in {self.d_state}, got {B_mat.shape}"
+            assert C_mat.shape[-1] == self.d_state, f"Expected C_mat shape to end in {self.d_state}, got {C_mat.shape}"
+
         dt = nn.softplus(self.dt_proj(dt_raw))     # [B, L, d_inner]
 
         # ZOH discretization
@@ -90,8 +108,13 @@ class MambaBlock(nn.Module):
     def __call__(self, x, h_state=None):
         # x: [B, L, d_model]
         residual = x
-        x_normed = self.norm(x)
 
+        if self.debug:
+            assert x.ndim == 3, f"Expected 3D tensor [B, L, d_model], got {x.shape}"
+            assert x.shape[-1] == self.norm.weight.shape[0], \
+                f"Expected last dimension of x to be {self.norm.weight.shape[0]}, got {x.shape[-1]}"
+
+        x_normed = self.norm(x)
         xz = self.in_proj(x_normed)
         x_in, z = mx.split(xz, [self.d_inner], axis=-1)
 
@@ -106,6 +129,12 @@ class MambaBlock(nn.Module):
         else:
             ssm_state = mx.zeros((B, self.d_inner, self.d_state))
             conv_state = mx.zeros((B, self.d_conv - 1, self.d_inner))
+
+        if self.debug:
+            assert ssm_state.shape == (B, self.d_inner, self.d_state), \
+                f"Expected ssm_state shape {(B, self.d_inner, self.d_state)}, got {ssm_state.shape}"
+            assert conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {conv_state.shape}"
 
         # Causal depthwise conv — prepend buffer
         x_padded = mx.concatenate([conv_state, x_in], axis=1)
@@ -129,6 +158,12 @@ class MambaBlock(nn.Module):
             "conv_state": new_conv_state
         }
 
+        if self.debug:
+            assert h_out.shape == (B, self.d_inner, self.d_state), \
+                f"Expected output ssm_state shape {(B, self.d_inner, self.d_state)}, got {h_out.shape}"
+            assert new_conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected output conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {new_conv_state.shape}"
+
         return self.out_proj(y_gated) + residual, new_state
 
     # ── Inference-only: single step recurrence ──────────────
@@ -140,6 +175,10 @@ class MambaBlock(nn.Module):
         orig_shape = x_t.shape
         x_t_flat = x_t.reshape(-1, orig_shape[-1])
         B = x_t_flat.shape[0]
+
+        if self.debug:
+            assert x_t_flat.shape[-1] == self.norm.weight.shape[0], \
+                f"Expected last dimension of x_t to be {self.norm.weight.shape[0]}, got {x_t_flat.shape[-1]}"
 
         x_normed = self.norm(x_t_flat)
         xz = self.in_proj(x_normed)
@@ -154,6 +193,12 @@ class MambaBlock(nn.Module):
         else:
             ssm_state = mx.zeros((B, self.d_inner, self.d_state))
             conv_state = mx.zeros((B, self.d_conv - 1, self.d_inner))
+
+        if self.debug:
+            assert ssm_state.shape == (B, self.d_inner, self.d_state), \
+                f"Expected ssm_state shape {(B, self.d_inner, self.d_state)}, got {ssm_state.shape}"
+            assert conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {conv_state.shape}"
 
         # Conv step: slide window
         x_in_expanded = x_in[:, None, :]
@@ -170,11 +215,21 @@ class MambaBlock(nn.Module):
         # SSM step
         x_conv_activated = nn.silu(x_conv)
 
-        dr = self.x_proj.weight.shape[0] - self.d_state * 2
-        ds = self.d_state
-
         xbc = self.x_proj(x_conv_activated)
-        dt_raw, B_mat, C_mat = mx.split(xbc, [dr, dr + ds], axis=-1)
+
+        if self.debug:
+            assert xbc.shape[-1] == self.dt_rank + 2 * self.d_state, \
+                f"Expected xbc last dimension to be {self.dt_rank + 2 * self.d_state}, got {xbc.shape[-1]}"
+
+        dt_raw, B_mat, C_mat = mx.split(
+            xbc, [self.dt_rank, self.dt_rank + self.d_state], axis=-1
+        )
+
+        if self.debug:
+            assert dt_raw.shape[-1] == self.dt_rank, f"Expected dt_raw shape to end in {self.dt_rank}, got {dt_raw.shape}"
+            assert B_mat.shape[-1] == self.d_state, f"Expected B_mat shape to end in {self.d_state}, got {B_mat.shape}"
+            assert C_mat.shape[-1] == self.d_state, f"Expected C_mat shape to end in {self.d_state}, got {C_mat.shape}"
+
         dt = nn.softplus(self.dt_proj(dt_raw))
 
         A = -mx.exp(self.A_log)
@@ -195,5 +250,11 @@ class MambaBlock(nn.Module):
             "ssm_state": new_ssm_state,
             "conv_state": new_conv_state
         }
+
+        if self.debug:
+            assert new_ssm_state.shape == (B, self.d_inner, self.d_state), \
+                f"Expected new_ssm_state shape {(B, self.d_inner, self.d_state)}, got {new_ssm_state.shape}"
+            assert new_conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                f"Expected new_conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {new_conv_state.shape}"
 
         return out, new_state

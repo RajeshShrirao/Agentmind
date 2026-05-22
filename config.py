@@ -14,7 +14,7 @@ class AgentMindConfig:
     d_state: int = 16        # memory per channel
     d_conv: int = 4          # causal conv kernel
     expand: int = 2          # d_inner = expand × d_model = 4096
-    dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 128
+    dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 64
 
     # Hybrid attention
     n_heads: int = 8
@@ -43,13 +43,17 @@ class AgentMindConfig:
     user_id: int = 14
     assistant_id: int = 15
 
+    def __post_init__(self):
+        if self.dt_rank == -1:
+            self.dt_rank = math.ceil(self.d_model / 16)
+
     @property
     def d_inner(self) -> int:
         return int(self.expand * self.d_model)
 
     @property
     def dt_rank_val(self) -> int:
-        return math.ceil(self.d_model / 16) if self.dt_rank == -1 else self.dt_rank
+        return self.dt_rank
 
     @property
     def ffn_hidden(self) -> int:
@@ -65,7 +69,7 @@ class AgentMindConfig:
         d = self.d_model
         di = self.d_inner
         ds = self.d_state
-        dr = self.dt_rank_val
+        dr = self.dt_rank
         dh = self.ffn_hidden
         H = self.n_heads
 

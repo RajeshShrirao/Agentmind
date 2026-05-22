@@ -130,6 +130,58 @@ Status: ❌ → ✅ TaskRouter (65K classifier)
 
 ## `[uncommitted]` — 2026-05-22
 
+**agent.py — router-aware AgentLoop with SSM state persistence across specialist switches.**
+
+Implemented the full `AgentLoop` class from the design doc's Inference Flow section.
+
+### `AgentLoop` design
+
+- **SSM state (`self.h_states`) persists across entire session** — never reset on specialist switch, tool call round, or observe injection. The backbone processes every token; the adapter only biases the output distribution.
+- **Router dispatch on backbone hidden state** — `_select_specialist()` passes `backbone.last_hidden[:, -1:, :]` to the router. This runs on the raw substrate representation *before* specialist bias is applied, keeping the router stable.
+- **Fallback to `"tool_caller"`** — `router.select_expert(threshold=0.6)` returns tool_caller if confidence for all specialists is below 0.6.
+- **Adapter swapping is lazy** — `_load_adapter()` only calls `backbone.load_lora()` when the adapter name changes (typically once per conversation). Subsequent generations stay in the same domain.
+
+### Generation loop
+
+1. Build prompt with system + user + assistant prefix
+2. `forward_with_state()` processes the entire prompt, carrying forward `h_states`
+3. Router selects specialist from `backbone.last_hidden`
+4. Token-by-token generation with temperature + top-p nucleus sampling
+5. On `<|tool_call|>` boundary: continue generating, parse JSON tool call from accumulated text, execute tool, inject `<|observe|>` + result, continue with same SSM state
+6. On `<eos>`: stop
+
+### Tool implementations
+
+- `web_search(query)` — DuckDuckGo lite HTML API via `urllib`, returns up to 10 result snippets
+- `run_python(code)` — `subprocess.run` with `python3 -c`, 10-second timeout, captures stdout/stderr
+- `read_file(path)` — `Path.read_text()`, max 10KB, resolves relative to CWD
+
+### CLI
+
+```
+python agent.py --backbone ./apprentice-system-4bit/backbone \
+    --adapters ./apprentice-system-4bit/adapters \
+    --router ./apprentice-system-4bit/router \
+    --query "Search arxiv for Mamba SSM papers"
+```
+
+Supports both single-query (`--query`) and interactive mode (no `--query`).
+
+### Smoke test
+
+```
+AgentLoop created successfully
+Active adapter: None
+SSM state keys: []     # empty before first run
+Response: grainslaser. ...  # untrained model output
+SSM state keys after run: 12  # 12 Mamba blocks produce state
+                              # (4 attention blocks don't)
+```
+
+---
+
+## `[uncommitted]` — 2026-05-22
+
 **eval.py — per-apprentice evaluation + interference detection.**
 
 Added two new functions to the evaluation module:

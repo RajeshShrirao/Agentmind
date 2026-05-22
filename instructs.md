@@ -20,12 +20,127 @@
 | Training loop (grad accum, NaN recovery, curriculum) | ✅ Done | `train.py` runs end-to-end |
 | Eval infrastructure (perplexity, tool accuracy, format) | ✅ Done | `eval.py` has all 3 paths |
 | Bug remediation (token IDs, labels, registries) | ✅ Done | 73/73 tests pass |
-| Per-apprentice data generated | ✅ Done | 10K samples across 5 domains |
+| Per-apprentice data generated (v1, template-only) | ✅ Done | 10K samples across 5 domains |
 | Cognitive apprenticeship doc | ✅ Done | `docs/cognitive_apprenticeship.md` |
 
 ---
 
-## Phase 0 — Apprenticeship Infrastructure
+## Phase -1: Per-Expert Data Augmentation
+
+> Current 10K/domain is template-only (see `generate_scaled_synthetic.py`).  
+> The model learns formatting, not semantics. We need real tool trajectories.  
+> Use `build_corpus.py` as reference for HF dataset downloading.  
+> ⚠️ No Cerebras/API dependency — that was a bottleneck in the old design.
+
+### 🤖 Prompt 0 — Write prepare_data/ with per-domain HF + synthetic scripts
+```
+Read build_corpus.py (HF dataset downloading pattern) and generate_scaled_synthetic.py (synthetic template pattern).
+
+Create a prepare_data/ directory with one script per apprentice domain.
+Each script must download domain-relevant HuggingFace datasets (streaming),
+convert them to apprentice JSONL format, and fall back to synthetic templates
+when real data is sparse.
+
+Goal: 25K-50K diverse samples per domain (up from 10K template-only).
+
+Directory structure:
+prepare_data/
+├── __init__.py
+├── base.py                  # Shared: HF download, format conversion, train/val split, combine
+├── tool_caller.py           # ToolBench, ToolACE, API-Bank → tool_call patterns
+├── planner.py               # WebArena, AgentInstruct planning → multi-step trajectories
+├── recovery.py              # Synthetic-only (real failure data is rare). Creative failure modes.
+├── code.py                  # The Stack (Python), CodeAlpaca, BigCode → code tool calls
+├── research.py              # FineWeb, UltraChat research → search→fetch→synthesize
+├── run_all.py               # Orchestrates all 5, outputs summary
+└── domain_configs.py        # Per-domain HF dataset list + template config
+
+base.py requirements:
+1. download_hf_dataset(name, split, filter_fn, max_samples) → iterable of dicts
+   - Streaming=True, handle errors gracefully (skip unavailable datasets)
+   - filter_fn: (sample) → bool, applied per-sample
+   - Return generator to avoid OOM
+2. convert_to_apprentice(raw_samples, domain, format_fn) -> list[dict]
+   - format_fn: (raw_sample) → {"messages": [{"role": ..., "content": ...}, ...]}
+   - Must inject domain field for router labels
+3. combine(hf_samples, synthetic_fn, n_synthetic, adversarial_rate) → list[dict]
+   - Merge HF data with synthetic fallback
+   - Apply domain-appropriate adversarial rate
+4. train_val_split(samples, val_frac=0.05) → (train, val)
+5. write_jsonl(samples, path)
+
+Per-domain scripts requirements:
+- Each script:
+  1. Imports from base.py
+  2. Defines domain-specific dataset list (2-3 HF datasets each)
+  3. Defines synthetic fallback_fn (uses generate_scaled_synthetic.py patterns)
+  4. Defines adversarial_rate specific to domain
+  5. Downloads, converts, combines, splits, writes
+  6. Reports dataset composition (% real vs synthetic, adversarial rate)
+
+domain_configs.py: structure
+DOMAIN_CONFIGS = {
+    "tool_caller": {
+        "hf_datasets": [
+            ("ToolBench/ToolBench", "train", lambda x: True, 5000),
+            ("THUDM/AgentInstruct", "train", lambda x: "tool" in str(x).lower(), 3000),
+        ],
+        "synthetic_count": 20000,
+        "adversarial_rate": 0.3,
+    },
+    "planner": {
+        "hf_datasets": [
+            ("osunlp/WebArena", "train", lambda x: len(x.get("action", "")) > 10, 3000),
+            ("THUDM/AgentInstruct", "train", lambda x: "plan" in str(x).lower(), 3000),
+        ],
+        "synthetic_count": 25000,
+        "adversarial_rate": 0.3,
+    },
+    "recovery": {
+        "hf_datasets": [],  # No good HF data for failure recovery
+        "synthetic_count": 30000,
+        "adversarial_rate": 0.4,
+    },
+    "code": {
+        "hf_datasets": [
+            ("bigcode/the-stack", "train", lambda x: x.get("lang") == "python", 10000),
+            ("microsoft/CodeAlpaca", "train", None, 5000),
+        ],
+        "synthetic_count": 15000,
+        "adversarial_rate": 0.3,
+    },
+    "research": {
+        "hf_datasets": [
+            ("HuggingFaceFW/fineweb", "train", lambda x: len(x.get("text", "")) > 200, 10000),
+            ("HuggingFaceH4/ultrachat_200k", "train_sft", None, 5000),
+        ],
+        "synthetic_count": 20000,
+        "adversarial_rate": 0.3,
+    },
+}
+
+Key design rules:
+- NO Cerebras/OpenAI/API dependency — synthetic uses templates only
+- HF datasets must use streaming=True to avoid disk blowup
+- Each script must handle dataset download failures gracefully (skip, don't crash)
+- Output to data/apprentice_{domain}.jsonl (overwrite old template-only versions)
+- Also generate data/router_training.jsonl (sample 200 per domain, shuffled)
+- Report: total samples, % real vs synthetic, adversarial count, latent count
+
+Smoke test:
+python prepare_data/run_all.py
+Expected output:
+  [tool_caller] 35000 samples (HF: 8000, synth: 27000, adversarial: 10500)
+  [planner]     ...
+  [recovery]    ...
+  [code]        ...
+  [research]    ...
+  [router]      1000 samples (200 per domain)
+```
+
+After it passes:
+- 📝 **Update BUILD_LOG.md** — diary entry: what HF datasets mapped to which domains, yield rates from HF, challenges with format conversion, any datasets that were unavailable
+- 💾 **Commit** with message: `prepare_data/ — per-domain HF + synthetic data pipeline (25-50K/domain, no API dependency)`
 
 ### 🤖 Prompt 1 — Write apprentice.py
 ```
@@ -719,6 +834,7 @@ Check:
 
 | Step | Who | Log + Commit |
 |---|---|---|---|
+| Prepare per-domain HF + synthetic data (25-50K/domain) | 🤖 Claude Code | ✅ Required |
 | Write apprentice.py (CognitiveApprentice) | 🤖 Claude Code | ✅ Required |
 | Write router.py (TaskRouter) | 🤖 Claude Code | ✅ Required |
 | Update lora.py (save/load/reset adapter) | 🤖 Claude Code | ✅ Required |

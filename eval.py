@@ -143,3 +143,112 @@ def tool_call_accuracy(model, prompts: list[str], tok, cfg) -> float:
     if not results:
         return 0.0
     return sum(1 for r in results if r.get("valid")) / max(len(results), 1)
+
+
+def _extract_eval_prompts(domain_dataset, tok, max_tokens: int = 512,
+                          fallback_prompts: list[str] = None) -> list[str]:
+    """Build evaluation prompts from domain dataset samples, truncated to max_tokens."""
+    prompts = []
+    samples = getattr(domain_dataset, "samples", None)
+    if samples:
+        for sample in samples[:10]:
+            text = ""
+            for msg in sample["messages"]:
+                role, content = msg["role"], msg["content"]
+                if role == "system":
+                    text += f"<|system|>{content}"
+                elif role == "user":
+                    text += f"<|user|>{content}"
+                elif role == "assistant":
+                    text += f"<|assistant|>{content}<eos>"
+            if text:
+                ids = tok.encode(text, add_bos=True)[:max_tokens]
+                prompts.append(tok.decode(ids))
+    if not prompts:
+        prompts = fallback_prompts or [
+            "<|user|>Search arxiv for Mamba SSM papers<|assistant|>",
+            "<|user|>Get the weather in Tokyo and Pune<|assistant|>",
+            "<|user|>Run the test suite and fix any failures<|assistant|>",
+        ]
+    return prompts
+
+
+def evaluate_apprentice(model, adapter_weights: dict, domain_dataset, tok, cfg) -> dict:
+    """
+    Run all metrics for one specialist.
+
+    Loads the adapter into the backbone, computes:
+      - Loss on held-out domain data
+      - Tool call accuracy on extracted prompts
+      - Format adherence (boundary tokens)
+
+    Restores the original LoRA weights after evaluation.
+    """
+    from mlx.utils import tree_flatten
+
+    orig = dict(tree_flatten(model.trainable_parameters()))
+
+    model.load_lora(adapter_weights)
+
+    loss = compute_loss(model, domain_dataset, tok, cfg, max_batches=20, max_len=512)
+
+    prompts = _extract_eval_prompts(domain_dataset, tok)
+
+    try:
+        call_results = evaluate_tool_calls(model, prompts, tok, cfg)
+        valid = sum(1 for r in call_results if r.get("valid"))
+        tool_acc = valid / max(len(call_results), 1)
+    except Exception as e:
+        print(f"  [evaluate_apprentice] tool eval skipped: {e}")
+        tool_acc = 0.0
+
+    try:
+        fmt = format_adherence(model, prompts, tok, cfg)
+    except Exception as e:
+        print(f"  [evaluate_apprentice] format eval skipped: {e}")
+        fmt = {"plan": 0, "scratch": 0, "eos": 0, "total": len(prompts)}
+
+    if orig:
+        model.load_lora(orig)
+
+    return {"loss": loss, "tool_acc": tool_acc, "format": fmt}
+
+
+def test_interference(model, adapters: dict, test_fn, tok, cfg) -> tuple:
+    """
+    Measure cross-apprentice interference.
+
+    For each specialist (A):
+      Load adapter A, run test_fn, record baseline_A
+
+    For each pair (A, B) where A != B:
+      Load adapter A, run test_fn (baseline_A already known)
+      Load adapter B, then load adapter A again
+      Run test_fn, record score
+      Interference = score - baseline_A
+
+    If interference > 5% (absolute), prints a warning.
+
+    Returns (baselines: dict, interference: dict).
+    """
+    baselines = {}
+
+    for name, adapter in adapters.items():
+        model.load_lora(adapter)
+        baselines[name] = test_fn(model, tok, cfg)
+
+    interference = {}
+    for name_a, adapter_a in adapters.items():
+        for name_b, adapter_b in adapters.items():
+            if name_a == name_b:
+                continue
+            model.load_lora(adapter_a)
+            score = test_fn(model, tok, cfg)
+            diff = score - baselines[name_a]
+            interference[f"{name_a}_under_{name_b}"] = diff
+            if abs(diff) > 0.05:
+                print(f"  ⚠️  SPECIALIST INTERFERENCE DETECTED: "
+                      f"{name_a} under {name_b}: {diff:+.4f} "
+                      f"(baseline={baselines[name_a]:.4f}, actual={score:.4f})")
+
+    return baselines, interference

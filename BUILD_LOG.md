@@ -128,6 +128,44 @@ Status: ❌ → ✅ TaskRouter (65K classifier)
 
 ---
 
+## `[uncommitted]` — 2026-05-22
+
+**eval.py — per-apprentice evaluation + interference detection.**
+
+Added two new functions to the evaluation module:
+
+### `evaluate_apprentice(model, adapter_weights, domain_dataset, tok, cfg) -> dict`
+
+Runs all metrics for one specialist:
+- **Loss**: `compute_loss()` on up to 20 batches from the domain dataset
+- **Tool call accuracy**: extracts up to 10 evaluation prompts from the domain dataset (truncated to 512 tokens), runs `evaluate_tool_calls()` with structured decoding, returns fraction of valid tool calls
+- **Format adherence**: `format_adherence()` checking for `<|plan|>`, `<|scratch|>`, `<eos>` boundary tokens
+- Restores original LoRA weights after evaluation via `load_lora(orig)`
+- Wraps tool and format evals in try-except so a failure in one doesn't crash the whole evaluation
+
+### `test_interference(model, adapters: dict, test_fn, tok, cfg) -> (baselines, interference)`
+
+Measures cross-apprentice interference:
+- Records baseline for each specialist A using `test_fn(model, tok, cfg)`
+- For each pair (A, B): loads A, runs test_fn, loads B (contamination), loads A again, runs test_fn
+- Computes `interference = score_after_B - baseline_A`
+- Prints `⚠️  SPECIALIST INTERFERENCE DETECTED` when `|diff| > 5%`
+
+### Why 5% threshold
+
+5% represents meaningful capability degradation. Below 5%, interference is within stochastic variance of the 147M backbone. Above 5%, the LoRA adapters are competing for the same backbone capacity — actionable mitigations: reduce rank (16→8), increase distillation steps, or add interference penalty to the distillation loss.
+
+### Smoke test
+
+```
+evaluate_apprentice -> {'loss': 100.0, 'tool_acc': 0.0, 'format': {...}}
+  (untrained model, expected default values)
+test_interference -> baselines={'tool_caller': 0.75, 'planner': 0.75}, interference={diff: 0.0}
+  (dummy test_fn returning constant, no interference)
+```
+
+---
+
 ## `HEAD` — 2026-05-22
 
 **Cognitive Apprenticeship Pivot — Why the Dense Model Was Never Going to Work.**

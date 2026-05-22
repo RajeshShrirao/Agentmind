@@ -8,6 +8,40 @@
 
 ## `[uncommitted]` — 2026-05-22
 
+**apprentice.py — three fixes: latent_stage param, distill dataloader, freeze hygiene.**
+
+Three issues identified and fixed in the CognitiveApprentice:
+
+1. **latent_stage hardcoded to 1 in `train()`**: Added `latent_stage` parameter (default 1).
+   When `latent_stage >= 2`, `AgentDataset` (created from raw samples) sets `ds.latent_stage`
+   so `inject_latent_tokens` runs during `__getitem__`. When `latent_stage >= 3`,
+   `latent_loss_mask` is applied to targets in the training loop to zero out loss
+   between `<|think_start|>` and `<|think_end|>` boundaries. Verified: stage=2 and
+   stage=4 both produce correct loss progression.
+
+2. **`distill()` iterated raw data with no dataloader and undocumented format**:
+   Refactored `distill()` to accept the same raw sample format as `train()`:
+   `[{"domain": str, "messages": [{"role": str, "content": str}]}]`. Added internal
+   `_tokenize_samples()` helper that converts raw samples → `(ids, labels, domain)`
+   triples with proper `inject_latent_tokens` + `_make_labels` handling. The method
+   builds a shuffled dataloader internally rather than expecting pre-tokenized batches.
+   Also accepts `latent_stage` and `seq_len` parameters.
+
+3. **`train()` lacked explicit backbone freeze; `__init__` already calls `apply_lora`
+   which handles freezing**: Removed redundant `self.backbone.freeze()` that was
+   incorrectly added — it re-froze everything including LoRA A/B, making
+   `trainable_parameters()` empty. The `apply_lora` call in `__init__` correctly
+   freezes all non-LoRA weights and leaves only A/B trainable. Double-wrapping is
+   not a risk because `apply_lora` checks `isinstance(child, nn.Linear)` and
+   `LoRALinear` is not a subclass of `nn.Linear`.
+
+Bonus: Added `_make_labels()` and `_tokenize_samples()` helpers to avoid code
+duplication between `train()` and `distill()`.
+
+---
+
+## `[uncommitted]` — 2026-05-22
+
 **apprentice.py — CognitiveApprentice wrapper (LoRA save/load/reset + distill).**
 
 The `CognitiveApprentice` wraps the AgentMind-147M backbone with a LoRA adapter

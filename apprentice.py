@@ -109,20 +109,57 @@ class CognitiveApprentice:
         _reset(self.backbone)
         print(f"[apprentice] Reset adapter '{self.adapter_name}' to random init")
 
+    def _make_labels(self, ids, sample):
+        labels = [-100] * len(ids)
+        in_assistant = False
+        for i, tok_id in enumerate(ids):
+            if tok_id == self.cfg.assistant_id:
+                in_assistant = True
+            if in_assistant:
+                labels[i] = tok_id
+            if tok_id in (self.cfg.eos_id, self.cfg.user_id, self.cfg.system_id):
+                in_assistant = False
+        return labels
+
+    def _tokenize_samples(self, dataset, tokenizer, seq_len, latent_stage):
+        from model.latent import inject_latent_tokens
+        import copy
+
+        tokenized = []
+        for sample in dataset:
+            s = copy.deepcopy(sample)
+            s = inject_latent_tokens(s, tokenizer, latent_stage)
+            text = ""
+            for msg in s["messages"]:
+                role = msg["role"]
+                content = msg["content"]
+                if role == "system":
+                    text += f"<|system|>{content}"
+                elif role == "user":
+                    text += f"<|user|>{content}"
+                elif role == "assistant":
+                    text += f"<|assistant|>{content}<eos>"
+            ids = tokenizer.encode(text, add_bos=True)[:seq_len]
+            labels = self._make_labels(ids, s)[:seq_len]
+            tokenized.append({"ids": ids, "labels": labels, "domain": s.get("domain", self.adapter_name)})
+        return tokenized
+
     def train(self, dataset, tokenizer=None, steps=500, lr=2e-4, seq_len=256,
-              warmup=50, grad_clip=1.0, log_every=50):
+              warmup=50, grad_clip=1.0, log_every=50, latent_stage=1):
         from data.pipeline import AgentDataset, make_dataloader
+        from model.latent import latent_loss_mask
 
         if isinstance(dataset, list) and len(dataset) > 0:
-            if isinstance(dataset[0], dict):
+            if isinstance(dataset[0], dict) and "messages" in dataset[0]:
                 ds = AgentDataset.__new__(AgentDataset)
                 ds.samples = dataset
                 ds.cfg = self.cfg
                 ds.tok = tokenizer
-                ds.latent_stage = 1
+                ds.latent_stage = latent_stage
                 ds.ids_array = None
                 ds.labels_array = None
-                ds.weights = {"instruction": 0.3, "tool_single": 0.3, "agent_multi": 0.25, "recovery": 0.15}
+                ds.weights = {"instruction": 0.3, "tool_single": 0.3,
+                              "agent_multi": 0.25, "recovery": 0.15}
                 dataset = ds
 
         optimizer = optim.AdamW(learning_rate=lr, weight_decay=0.01)
@@ -141,6 +178,12 @@ class CognitiveApprentice:
                 if step >= steps:
                     break
 
+                if latent_stage >= 3:
+                    targets = latent_loss_mask(
+                        input_ids, targets,
+                        self.cfg.think_start_id, self.cfg.think_end_id
+                    )
+
                 def loss_fn(params):
                     self.backbone.update(params)
                     logits, _ = self.backbone(input_ids)
@@ -157,8 +200,8 @@ class CognitiveApprentice:
 
                 if step % log_every == 0 or step == steps - 1:
                     tok_per_sec = (input_ids.shape[1]) / (time.time() - t0 + 1e-8)
-                    print(f"[{self.adapter_name}] step {step:3d}/{steps} loss {loss_val:.4f} lr {lr_now:.2e} "
-                          f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
+                    print(f"[{self.adapter_name}] step {step:3d}/{steps} loss {loss_val:.4f} "
+                          f"lr {lr_now:.2e} grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
                     t0 = time.time()
 
                 step += 1
@@ -166,8 +209,13 @@ class CognitiveApprentice:
         print(f"[apprentice] '{self.adapter_name}' training complete ({step} steps)")
         return self
 
-    def distill(self, backbone, specialists, data, beta=0.5, mtp_weight=0.2,
-                steps=50, lr=1e-5, grad_clip=1.0, log_every=10):
+    def distill(self, backbone, specialists, dataset, tokenizer=None, beta=0.5, mtp_weight=0.2,
+                steps=50, lr=1e-5, grad_clip=1.0, seq_len=512, log_every=10, latent_stage=1):
+        from model.latent import latent_loss_mask
+        import random
+
+        tokenized = self._tokenize_samples(dataset, tokenizer, seq_len, latent_stage)
+
         backbone.train()
         backbone.unfreeze()
         backbone_params = {k: v for k, v in backbone.trainable_parameters().items()
@@ -178,12 +226,19 @@ class CognitiveApprentice:
         t0 = time.time()
 
         while step < steps:
-            for batch in data:
+            random.shuffle(tokenized)
+            for sample in tokenized:
                 if step >= steps:
                     break
-                ids = batch["ids"]
-                labels = batch["labels"]
-                domain = batch["domain"]
+                ids = mx.array([sample["ids"]])
+                labels = mx.array([sample["labels"]])
+                domain = sample["domain"]
+
+                if latent_stage >= 3:
+                    labels = latent_loss_mask(
+                        ids, labels,
+                        self.cfg.think_start_id, self.cfg.think_end_id
+                    )
 
                 s_logits = {}
                 for name, expert in specialists.items():

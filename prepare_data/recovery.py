@@ -23,6 +23,7 @@ def main(skip_hf=False):
     print(f"[{DOMAIN}] Preparing dataset (synthetic only)...")
     print(f"{'=' * 60}")
 
+    print(f"  [synth] Generating {CFG['synthetic_count']} synthetic samples...")
     result = combine(
         [],
         generate_recovery,

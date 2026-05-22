@@ -10,8 +10,7 @@ from datasets import load_dataset
 logger = logging.getLogger(__name__)
 
 HF_TOKEN = _os.environ.get("HF_TOKEN", None)
-# Short timeout so hung downloads fail fast
-_os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+_os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 
 class _HFDownloadError(Exception):
@@ -56,6 +55,7 @@ def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=No
     If the dataset is unavailable, logs a warning and yields nothing.
     config: optional sub-config name for datasets with multiple configs.
     """
+    print(f"    [HF] Loading {name} (config={config}, split={split}, max_samples={max_samples})...")
     try:
         load_kwargs = {
             "path": name,
@@ -67,11 +67,14 @@ def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=No
             load_kwargs["name"] = config
         load_kwargs.update(kwargs)
         ds = load_dataset(**load_kwargs)
+        print(f"    [HF] {name} loaded, iterating...")
     except Exception as e:
+        print(f"    [HF] FAILED to load {name} ({split}): {e}")
         logger.warning(f"Cannot load {name} ({split}): {e}")
         return
 
     yield from _safe_iter_dataset(ds, name, max_samples, filter_fn)
+    print(f"    [HF] {name} done ({max_samples or 'all'} samples processed)")
 
 
 def convert_to_apprentice(raw_samples, domain, format_fn):
@@ -147,7 +150,9 @@ def combine(hf_samples, synthetic_fn, n_synthetic, adversarial_rate, domain="", 
 
     synth_list = []
     synth_adversarial = 0
-    for _ in range(n_synthetic):
+    for i in range(n_synthetic):
+        if i > 0 and i % 5000 == 0:
+            print(f"    [synth] {i}/{n_synthetic} generated...")
         sample = synthetic_fn(adversarial_rate=adversarial_rate, latent_rate=latent_rate)
         synth_list.append(sample)
         content = json.dumps(sample.get("messages", ""))

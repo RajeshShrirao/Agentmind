@@ -65,11 +65,13 @@ def main(skip_hf=False):
             if fmt is None:
                 logger.warning(f"No format_fn for {ds_name}, skipping")
                 continue
+            print(f"  [HF] Processing {ds_name} (config={ds_config}, split={ds_split}, max={ds_max})...")
             raw = download_hf_dataset(ds_name, ds_split, ds_filter, ds_max, config=ds_config, **ds_kwargs)
             converted = list(convert_to_apprentice(raw, DOMAIN, fmt))
-            print(f"  HF {ds_name}: {len(converted)} samples")
+            print(f"  [HF] {ds_name}: {len(converted)} samples")
             all_hf.extend(converted)
 
+    print(f"  [synth] Generating {CFG['synthetic_count']} synthetic samples...")
     result = combine(
         all_hf,
         generate_tool_caller,

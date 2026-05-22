@@ -6,6 +6,38 @@
 
 ---
 
+## `[uncommitted]` — 2026-05-22
+
+**router.py — TaskRouter for apprentice dispatch (65K params, threshold-based fallback).**
+
+The router is a 65,925-parameter classifier that maps backbone hidden states → domain logits:
+
+```
+d_model(1024) → Linear(1024, 64) → ReLU → Linear(64, 5) → domain_logits
+```
+
+Key design:
+- **Mean pooling** over sequence dimension before classification — the backbone's per-token hidden states are averaged to get a single [B, d_model] representation per sample
+- **threshold=0.6 fallback**: if max softmax probability is below threshold, return `"tool_caller"` (the safest default — tool calling is the most general capability). In the inference loop, this catches ambiguous or out-of-distribution queries.
+- **Frozen backbone during training**: `backbone.forward_with_state()` in eval mode, no gradients flow into backbone params. The router learns to discriminate between domains from the backbone's last hidden representation alone.
+- **65,925 params** — layer 1: 1024×64 + 64 = 65,600; layer 2: 64×5 + 5 = 325; total 65,925 (~65K as specified)
+
+Implementation notes:
+- Uses `mx.mean(axis=1)` pooling rather than [CLS]-token because Mamba SSMs don't produce a position-agnostic [CLS] token — mean pooling gives a stable summary of the full sequence
+- `select_expert()` runs softmax normalization internally and checks against threshold before argmax
+- `train()` accepts a list of `{"domain": str, "messages": [token_ids]}` samples, runs backbone forward per sample, computes CE loss, and updates router params via Adam
+
+Smoke test confirms:
+- Output shape (1, 5) ✓
+- Uniform input → fallback to `"tool_caller"` ✓
+- High-confidence input → correct domain selection ✓
+- Parameter count 65,925 (~65K) ✓
+- Training loop executes 10 steps with mock backbone ✓
+
+Status: ❌ → ✅ TaskRouter (65K classifier)
+
+---
+
 ## `HEAD` — 2026-05-22
 
 **Cognitive Apprenticeship Pivot — Why the Dense Model Was Never Going to Work.**
@@ -459,7 +491,7 @@ HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct pr
 | Data pipeline (JSONL + NPZ) | ✅ Working |
 | Specialist data (10K × 5 domains) | ✅ Generated, diverse args + adversarial |
 | CognitiveApprentice wrapper | ❌ Pending (Prompt 1) |
-| TaskRouter (65K classifier) | ❌ Pending (Prompt 2) |
+| TaskRouter (65K classifier) | ✅ Built, smoke tested |
 | Adapter save/load/reset (lora.py) | ❌ Pending (Prompt 3) |
 | load_lora() fast swap | ❌ Pending (Prompt 4) |
 | train_specialist / distill_backbone | ❌ Pending (Prompt 5) |

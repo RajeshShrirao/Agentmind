@@ -15,15 +15,7 @@ from scheduler import CosineWarmupScheduler
 from init import init_agentmind
 from apprentice import kl_div
 
-# ── CLI ────────────────────────────────────────────────────
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--max-steps", type=int, default=None, help="Override total_steps (for testing)")
-parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint dir to resume from")
-parser.add_argument("--test-nan", action="store_true", help="Run the NaN injection and recovery test harness")
-args = parser.parse_args()
-
-# ── Config ────────────────────────────────────────────────
+# ── Default config (overridable when run as main) ─────────
 
 cfg = AgentMindConfig()
 
@@ -33,23 +25,20 @@ TRAIN_CFG = dict(
     warmup_steps  = 100,
     total_steps   = 3000,
     grad_clip     = 1.0,
-    batch_size    = 1,       # Reduced for 16GB Mac
-    grad_accum    = 8,       # Maintain effective batch size
+    batch_size    = 1,
+    grad_accum    = 8,
     seq_len       = 2048,
     lora_rank     = 16,
     lora_alpha    = 32.0,
     eval_every    = 500,
     save_every    = 200,
     save_dir      = "/Volumes/New Volume/checkpoints",
-    use_mtp       = False,     # Disabled for memory (re-enable after step 500)
+    use_mtp       = False,
     mtp_weight    = 0.2,
     mtp_start     = 500,
     latent_stage  = 1,
     seq_len_schedule = {0: 256, 500: 512, 1500: 1024},
 )
-
-if args.max_steps is not None:
-    TRAIN_CFG["total_steps"] = args.max_steps
 
 # ── Loss ──────────────────────────────────────────────────
 
@@ -600,7 +589,26 @@ def train_specialist(backbone, domain_dataset, domain_name,
 
     domain_dataset.latent_stage = latent_stage
 
-    apply_lora(backbone, rank=16, alpha=32.0)
+    from lora import LoRALinear as _LoRALinear
+
+    # Check if LoRA is already applied (e.g. by orchestrator after round 1).
+    # If so, don't call apply_lora again — it would freeze existing LoRALinear modules.
+    _has_lora = False
+    for mod in backbone.modules():
+        if isinstance(mod, _LoRALinear):
+            _has_lora = True
+            break
+
+    if not _has_lora:
+        apply_lora(backbone, rank=16, alpha=32.0)
+    else:
+        backbone.freeze()
+        # MLX freeze() adds A/B to _no_grad on each LoRALinear.
+        # Remove them surgically so only LoRA adapters are trainable.
+        for mod in backbone.modules():
+            if isinstance(mod, _LoRALinear):
+                mod._no_grad.discard('A')
+                mod._no_grad.discard('B')
 
     optimizer = optim.AdamW(learning_rate=lr, weight_decay=0.01)
     warmup = min(50, max(1, steps // 10))
@@ -790,10 +798,26 @@ def distill_backbone(backbone, specialists, combined_data,
             step += 1
 
     backbone.freeze()
-    print(f"[distill] Complete ({step} steps)")
+    final_loss = loss.item() if step > 0 else float('inf')
+    print(f"[distill] Complete ({step} steps) final_loss={final_loss:.4f}")
+    return final_loss
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-steps", type=int, default=None, help="Override total_steps (for testing)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint dir to resume from")
+    parser.add_argument("--test-nan", action="store_true", help="Run the NaN injection and recovery test harness")
+    args = parser.parse_args()
+
+    if args.max_steps is not None:
+        TRAIN_CFG["total_steps"] = args.max_steps
+
+    if args.resume is not None:
+        TRAIN_CFG["resume"] = args.resume
+    else:
+        TRAIN_CFG.pop("resume", None)
+
     if args.test_nan:
         run_nan_test_harness()
     else:

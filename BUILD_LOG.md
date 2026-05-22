@@ -756,3 +756,48 @@ distill_backbone: 2 steps, loss 10.44→9.73, CE+KL+MTP all active
 6. **End-to-end agent test** — router → specialist swap → tool call → observe → continue. Does SSM state survive the switch?
 7. **Latent reasoning A/B test** — compare tool accuracy with and without the latent curriculum. If no benefit, gut it.
 
+---
+
+## `[uncommitted]` — 2026-05-22
+
+**training_orchestrator.py — round management loop for apprenticeship protocol.**
+
+Implemented the full apprenticeship orchestration loop.
+
+### New file
+
+- `training_orchestrator.py` — orchestrator that runs the complete apprenticeship protocol:
+  - Explicit per-round latent stage mapping from the design doc (Round 1→stage 1, Round 2→stage 2, Round 3+→stage 4)
+  - Loads backbone, applies LoRA once, then iterates through all 5 rounds
+  - Each round: reset_adapter → `train_specialist()` (backbone frozen, MTP off) → save adapter → reset_adapter → `distill_backbone()` (backbone unfrozen, MTP on after step 20)
+  - Distillation happens after EVERY round (rounds 1-5), not just round 1
+  - Router training from `router_training.jsonl` using `TaskRouter.train()`
+  - Final export: backbone.safetensors + per-domain adapters + router
+  - `run_round()` standalone function callable for testing single rounds
+  - `gather_combined_data()` collects samples from all completed domains, tagging each with `"domain"` key for distillation domain routing
+  - Resume support via `--resume` (detects completed adapters, skips them)
+  - CLI: `--rounds 1-5`, `--resume`, `--save-dir`
+
+### Modified
+
+- `train.py`:
+  - `distill_backbone()` now returns `final_loss` (needed for `run_round()` result dict)
+  - Moved `argparse` + config instantiation inside `if __name__ == "__main__"` block so that importing `train.py` from the orchestrator doesn't hijack CLI args
+  - `train_specialist()` now detects pre-existing LoRA (when orchestrator applies it once at init). If LoRALinear modules already exist, it freezes the backbone and surgically removes `A`/`B` from `_no_grad` sets instead of calling `apply_lora` again (which would freeze the existing adapters)
+
+### Design decisions
+
+- **Latent stage passed directly**, not derived from global step count: `ROUNDS` config specifies `latent_stage` per round, passed directly to `train_specialist()`. This keeps the mapping explicit and auditable.
+- **reset_adapter between specialist training and distillation**: After specialist training LoRA matrices are trained, they're saved, then reset to random. Distillation starts from a clean LoRA slate. After distillation, the backbone's base weights have absorbed specialist knowledge, and the LoRA matrices are reset again before the next round's specialist training.
+- **MLX freeze mechanism**: MLX v3.14 uses `_no_grad` sets instead of `_freeze` booleans. `freeze()` adds param names to `_no_grad`, `unfreeze()` removes them. Surgical manipulation (`mod._no_grad.discard('A')`) correctly exposes only LoRA A/B params for training while keeping base weights frozen.
+- **Combined data for distillation**: Each round gathers data from ALL completed domains (not just the current round's). Samples are tagged with `"domain"` so `distill_backbone()` routes to the correct specialist teacher.
+
+### Smoke test
+
+```
+python3 -c "from training_orchestrator import run_round; ..."
+→ Specialist trains 2 steps, adapter saved (9744 KB)
+→ Distillation 1 step, loss=0.0000 (truncated run)
+→ Returns: {adapter_path, distill_loss}
+```
+

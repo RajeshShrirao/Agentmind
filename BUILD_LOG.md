@@ -1056,3 +1056,54 @@ Root cause analysis:
 | 16GB RAM is tight at 95% utilization | Hardware monitoring now tracks this explicitly |
 | Adapter size: 9.7 MB | Fast swap, low storage cost per specialist |
 
+---
+
+## `6b3f469` — 2026-05-23
+
+**Structured stats logger (`stats_logger.py`)** — persistent JSONL log of all training metrics.
+
+Instead of relying solely on stdout (scrolls away), every metric is now written to
+`logs/training.jsonl` as JSON lines. Each entry is self-describing with a `type` field
+and `timestamp`.
+
+### File: `stats_logger.py`
+
+Simple `StatsLogger` class with 6 record types:
+
+| Method | `type` field | What it captures |
+|--------|-------------|------------------|
+| `step()` | `step` | Per-step loss, grad_norm, lr, tok/s, seq_len, domain |
+| `phase()` | `phase` | Phase boundaries (start/complete of orchestrator, rounds) |
+| `summary()` | `summary` | End-of-phase aggregates (val_loss, elapsed, nan/zero counts, acc) |
+| `hw()` | `hw` | CPU%, RAM%, swap from monitor.py |
+| `dataset()` | `dataset` | HF dataset name, samples, timing, yield rate |
+
+Output goes to `logs/training.jsonl` (auto-created directory). The `GLOBAL` singleton is
+imported and used throughout — no threading concerns since MLX training is single-process.
+
+### Integration points
+
+| File | What logs |
+|------|-----------|
+| `train.py:train_specialist()` | `.step()` every 50 steps + `.summary()` at end |
+| `train.py:distill_backbone()` | `.step()` every 10 steps + `.summary()` at end |
+| `router.py:TaskRouter.train()` | `.step()` every 50 steps + `.summary()` at end |
+| `training_orchestrator.py` | `.phase()` at start/complete of each round + router phase |
+| `monitor.py:print_hw()` | `.hw()` on every call (all existing call sites) |
+| `prepare_data/base.py` | `.dataset()` after each HF download completes |
+
+### Usage
+
+Querying the log is trivial with standard tools:
+
+```bash
+# All specialist step logs
+python3 -c "import json; [print(json.dumps(e,indent=2)) for e in map(json.loads,open('logs/training.jsonl')) if e['type']=='step' and e.get('phase')=='specialist']"
+
+# Last loss per phase
+tail -1 logs/training.jsonl | python3 -m json.tool
+
+# All hardware snapshots
+grep '"type":"hw"' logs/training.jsonl | python3 -m json.tool
+```
+

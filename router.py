@@ -1,9 +1,10 @@
-import json, random
+import json, random, time
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 from pathlib import Path
+from stats_logger import GLOBAL as log
 
 
 class TaskRouter(nn.Module):
@@ -113,6 +114,8 @@ class TaskRouter(nn.Module):
                     for d, v in per_domain.items()
                 )
                 print(f"[router] step {step}/{steps}  loss={avg_loss:.4f}  acc={acc:.1f}%  [{per_domain_acc}]")
+                log.step("router", step, steps, avg_loss, acc=acc,
+                         per_domain_acc=per_domain_acc)
 
         elapsed = time.time() - t_start
         total_correct = sum(v["correct"] for v in per_domain.values())
@@ -121,8 +124,11 @@ class TaskRouter(nn.Module):
             f"{d}={v['correct']/v['total']*100:.0f}%"
             for d, v in per_domain.items()
         )
+        final_acc = total_correct / total_all * 100
         print(f"[router] Complete ({steps} steps, {elapsed:.0f}s) "
-              f"acc={total_correct/total_all*100:.1f}%  [{per_domain_acc}]")
+              f"acc={final_acc:.1f}%  [{per_domain_acc}]")
+        log.summary("router", steps=steps, elapsed=elapsed, acc=final_acc,
+                    per_domain_acc=per_domain_acc)
         return self
 
     def save(self, path):

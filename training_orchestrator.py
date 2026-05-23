@@ -19,6 +19,7 @@ Usage:
 import json, os, argparse, copy, time
 from pathlib import Path
 from monitor import print_hw
+from stats_logger import GLOBAL as log
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -276,6 +277,7 @@ def main():
         else:
             print(f"Resume dir {resume_dir} not found — starting fresh")
 
+    log.phase("orchestrator", "start", rounds=args.rounds)
     print_hw("start")
     # Round loop
     all_adapter_weights = {}
@@ -294,6 +296,10 @@ def main():
             completed_round_entries.append(round_cfg)
             continue
 
+        log.phase("round", "start", domain=round_cfg["domain"],
+                  spec_steps=round_cfg["specialist_steps"],
+                  seq_len=round_cfg["seq_len"],
+                  latent_stage=round_cfg["latent_stage"])
         print_hw(f"round {idx+1} start")
         result = run_round(
             backbone=backbone,
@@ -307,6 +313,8 @@ def main():
             existing_adapters=all_adapter_weights if all_adapter_weights else None,
         )
 
+        log.phase("round", "complete", domain=round_cfg["domain"],
+                  distill_loss=result.get("distill_loss", "N/A"))
         print_hw(f"round {idx+1} end")
         distill_loss = result.get("distill_loss", "N/A")
         print(f"\n  Round {idx+1} ({round_cfg['domain']}) complete")
@@ -320,6 +328,7 @@ def main():
 
         completed_round_entries.append(round_cfg)
 
+    log.phase("router", "start")
     print_hw("router")
     # Train router
     print(f"\n{'='*60}")
@@ -349,6 +358,8 @@ def main():
     else:
         print(f"  Warning: {router_data_path} not found — skipping router training")
 
+    log.phase("router", "complete")
+
     # Final export
     print(f"\n{'='*60}")
     print("  Saving final artifacts")
@@ -361,6 +372,8 @@ def main():
     print(f"  Backbone saved -> {backbone_path}")
 
     total_elapsed = time.time() - t_start
+    log.summary("orchestrator", total_elapsed=total_elapsed,
+                rounds=args.rounds, completed=[r["domain"] for r in completed_round_entries])
     print_hw("end")
     print(f"\n{'='*60}")
     print(f"  Training complete. All artifacts in {save_dir}")

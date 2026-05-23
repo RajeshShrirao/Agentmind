@@ -4,6 +4,7 @@ from pathlib import Path
 
 from datasets import load_dataset
 from monitor import print_hw, hw_summary
+from stats_logger import GLOBAL as log
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def _safe_iter_dataset(ds, name, max_samples=None, filter_fn=None):
         yield sample
 
 
-def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=None, **kwargs):
+def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=None, domain="unknown", **kwargs):
     """Download a HF dataset with streaming=True.
 
     Yields raw samples, optionally filtered. Handles errors gracefully.
@@ -80,7 +81,11 @@ def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=No
         yield sample
 
     elapsed = time.time() - t0
-    print(f"    [HF] {name} done: {count} samples in {elapsed:.0f}s ({count/elapsed:.1f}/s)" if elapsed > 1 else f"    [HF] {name} done: {count} samples")
+    rate = count/elapsed if elapsed > 1 else 0
+    print(f"    [HF] {name} done: {count} samples in {elapsed:.0f}s ({rate:.1f}/s)" if elapsed > 1 else f"    [HF] {name} done: {count} samples")
+    log.dataset(name=name, domain=domain,
+                split=split, config=config, samples=count, elapsed=elapsed,
+                yield_rate=rate)
 
 
 def convert_to_apprentice(raw_samples, domain, format_fn):

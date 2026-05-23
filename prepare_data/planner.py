@@ -68,7 +68,7 @@ def main(skip_hf=False):
                 continue
             ds_t0 = time.time()
             print(f"  [HF] Processing {ds_name} (config={ds_config}, split={ds_split}, max={ds_max})...")
-            raw = download_hf_dataset(ds_name, ds_split, ds_filter, ds_max, config=ds_config, **ds_kwargs)
+            raw = download_hf_dataset(ds_name, ds_split, ds_filter, ds_max, config=ds_config, domain=DOMAIN, **ds_kwargs)
             converted = list(convert_to_apprentice(raw, DOMAIN, fmt))
             ds_elapsed = time.time() - ds_t0
             print(f"  [HF] {ds_name}: {len(converted)} samples in {ds_elapsed:.0f}s")

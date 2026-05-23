@@ -1,5 +1,6 @@
 import subprocess
 import os
+from stats_logger import GLOBAL as log
 
 PAGE_SIZE = 16384
 
@@ -57,6 +58,12 @@ def hw_summary():
             f"RAM:{m['ram_pct']:.0f}% ({m['ram_used_gb']:.1f}/{m['ram_total_gb']:.1f}GB) "
             f"swap:[{m['swap']}]")
 
+def get_hw_metrics():
+    return _hw_metrics()
+
 def print_hw(label=""):
+    m = _hw_metrics()
     prefix = f"[hw] {label}  " if label else "[hw] "
     print(f"{prefix}{hw_summary()}")
+    log.hw(label, m["cpu_pct"], m["ram_pct"], m["ram_used_gb"],
+           m["ram_total_gb"], m["swap"])

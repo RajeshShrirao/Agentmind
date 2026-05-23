@@ -5,6 +5,7 @@ from mlx.utils import tree_flatten, tree_map
 import time, json, os, random, argparse, copy
 from pathlib import Path
 from monitor import print_hw
+from stats_logger import GLOBAL as log
 
 from config import AgentMindConfig
 from model.agent_lm import AgentMind
@@ -673,6 +674,9 @@ def train_specialist(backbone, domain_dataset, domain_name,
                 print(f"[{domain_name}] step {step:3d}/{steps} "
                       f"loss {loss.item():.4f} lr {lr_now:.2e} "
                       f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
+                log.step("specialist", step, steps, loss.item(), lr=lr_now,
+                         grad_norm=grad_norm, tok_per_s=tok_per_sec,
+                         seq_len=seq_len, domain=domain_name)
                 t0 = time.time()
 
             step += 1
@@ -689,9 +693,12 @@ def train_specialist(backbone, domain_dataset, domain_name,
     backbone.train()
 
     elapsed = time.time() - t_start
-    val_loss_str = f"val_loss={sum(val_losses)/len(val_losses):.4f}" if val_losses else "val_loss=N/A"
+    val_loss_val = sum(val_losses)/len(val_losses) if val_losses else None
+    val_loss_str = f"val_loss={val_loss_val:.4f}" if val_loss_val else "val_loss=N/A"
     print(f"[train_specialist] '{domain_name}' complete ({step} steps, {elapsed:.0f}s) "
           f"{val_loss_str} nan={nan_count} zero_loss={zero_loss_count}")
+    log.summary("specialist", domain=domain_name, steps=step, elapsed=elapsed,
+                val_loss=val_loss_val, nan_count=nan_count, zero_loss_count=zero_loss_count)
 
     # Extract and return only LoRA A/B matrices
     params = dict(tree_flatten(backbone.trainable_parameters()))
@@ -835,6 +842,8 @@ def distill_backbone(backbone, specialists, combined_data,
                 print(f"[distill] step {step:3d}/{steps} "
                       f"loss {loss.item():.4f} "
                       f"grad_norm {grad_norm:.3f} {elapsed:.1f}s")
+                log.step("distill", step, steps, loss.item(), grad_norm=grad_norm,
+                         seq_len=seq_len)
                 t0 = time.time()
 
             step += 1
@@ -853,9 +862,12 @@ def distill_backbone(backbone, specialists, combined_data,
     backbone.freeze()
     final_loss = loss.item() if step > 0 else float('inf')
     elapsed = time.time() - t_start
-    val_loss_str = f"val_loss={sum(val_losses)/len(val_losses):.4f}" if val_losses else "val_loss=N/A"
+    val_loss_val = sum(val_losses)/len(val_losses) if val_losses else None
+    val_loss_str = f"val_loss={val_loss_val:.4f}" if val_loss_val else "val_loss=N/A"
     print(f"[distill] Complete ({step} steps) final_loss={final_loss:.4f} "
           f"{val_loss_str} ({elapsed:.0f}s) nan={nan_count} zero_loss={zero_loss_count}")
+    log.summary("distill", steps=step, elapsed=elapsed, final_loss=final_loss,
+                val_loss=val_loss_val, nan_count=nan_count, zero_loss_count=zero_loss_count)
     return final_loss
 
 

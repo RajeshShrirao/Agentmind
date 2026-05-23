@@ -4,6 +4,7 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 import time, json, os, random, argparse, copy
 from pathlib import Path
+from monitor import print_hw
 
 from config import AgentMindConfig
 from model.agent_lm import AgentMind
@@ -471,7 +472,7 @@ def train():
                 trainable = {k: v for k, v in model.trainable_parameters().items()
                              if not k.startswith("last_")}
                 optimizer.update(trainable, accum_grad)
-                mx.eval(model.parameters(), optimizer.state)
+                mx.eval(list(trainable.values()), optimizer.state)
 
                 # Check that post-update model parameters and optimizer state are fully finite
                 post_params_finite, post_param_key = check_finite(model.parameters())
@@ -617,12 +618,21 @@ def train_specialist(backbone, domain_dataset, domain_name,
     trainable = {k: v for k, v in backbone.trainable_parameters().items()
                  if not k.startswith("last_")}
 
+    # Hold out 5% for validation
+    n_total = len(domain_dataset)
+    n_val = max(1, n_total // 20)
+    val_indices = set(random.sample(range(n_total), n_val))
+    train_indices = [i for i in range(n_total) if i not in val_indices]
+
     backbone.train()
     step = 0
     t0 = time.time()
+    t_start = t0
+    nan_count = 0
+    zero_loss_count = 0
 
     while step < steps:
-        loader = make_dataloader(domain_dataset, batch_size=1, max_len=seq_len)
+        loader = make_dataloader(domain_dataset, batch_size=1, max_len=seq_len, indices=train_indices)
         for input_ids, targets in loader:
             if step >= steps:
                 break
@@ -644,17 +654,22 @@ def train_specialist(backbone, domain_dataset, domain_name,
             loss_finite = mx.isfinite(loss).item()
             grads_finite, _ = check_finite(grads)
             if not loss_finite or not grads_finite:
+                nan_count += 1
                 grads = tree_map(mx.zeros_like, grads)
                 optimizer.update(trainable, grads)
                 continue
 
+            if loss.item() == 0.0:
+                zero_loss_count += 1
+                print(f"  ⚠️  [train_specialist] Zero loss at step {step}/{steps} — mask empty. targets unique: {mx.unique(targets).tolist()[:10]}")
+
             grads, grad_norm = clip_gradients(grads, 1.0)
             optimizer.update(trainable, grads)
-            mx.eval(backbone.parameters(), optimizer.state)
+            mx.eval(list(trainable.values()), optimizer.state)
             lr_now = scheduler.step()
 
             if step % 50 == 0 or step == steps - 1:
-                tok_per_sec = (input_ids.shape[1]) / (time.time() - t0 + 1e-8)
+                tok_per_sec = (input_ids.shape[1] * 50) / (time.time() - t0 + 1e-8)
                 print(f"[{domain_name}] step {step:3d}/{steps} "
                       f"loss {loss.item():.4f} lr {lr_now:.2e} "
                       f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
@@ -662,7 +677,21 @@ def train_specialist(backbone, domain_dataset, domain_name,
 
             step += 1
 
-    print(f"[train_specialist] '{domain_name}' complete ({step} steps)")
+    # Validation loss on held-out set
+    val_losses = []
+    backbone.eval()
+    val_loader = make_dataloader(domain_dataset, batch_size=1, max_len=seq_len, indices=list(val_indices), shuffle=False)
+    for val_ids, val_targets in val_loader:
+        logits, _ = backbone(val_ids, return_mtp=False)
+        vl = cross_entropy_loss(logits, val_targets).item()
+        if mx.isfinite(vl) and vl > 0:
+            val_losses.append(vl)
+    backbone.train()
+
+    elapsed = time.time() - t_start
+    val_loss_str = f"val_loss={sum(val_losses)/len(val_losses):.4f}" if val_losses else "val_loss=N/A"
+    print(f"[train_specialist] '{domain_name}' complete ({step} steps, {elapsed:.0f}s) "
+          f"{val_loss_str} nan={nan_count} zero_loss={zero_loss_count}")
 
     # Extract and return only LoRA A/B matrices
     params = dict(tree_flatten(backbone.trainable_parameters()))
@@ -733,6 +762,12 @@ def distill_backbone(backbone, specialists, combined_data,
         domain = sample.get("domain", list(specialists.keys())[0])
         tokenized.append({"ids": ids, "labels": labels, "domain": domain})
 
+    # ── Hold out 5% for validation ──
+    random.shuffle(tokenized)
+    n_val = max(1, len(tokenized) // 20)
+    val_samples = tokenized[:n_val]
+    train_samples = tokenized[n_val:]
+
     # ── Distillation loop ──────────────────────────────────
     backbone.unfreeze()
     trainable = {k: v for k, v in backbone.trainable_parameters().items()
@@ -741,10 +776,13 @@ def distill_backbone(backbone, specialists, combined_data,
     optimizer = optim.AdamW(learning_rate=lr)
     step = 0
     t0 = time.time()
+    t_start = t0
+    nan_count = 0
+    zero_loss_count = 0
 
     while step < steps:
-        random.shuffle(tokenized)
-        for sample in tokenized:
+        random.shuffle(train_samples)
+        for sample in train_samples:
             if step >= steps:
                 break
 
@@ -780,13 +818,17 @@ def distill_backbone(backbone, specialists, combined_data,
             loss_finite = mx.isfinite(loss).item()
             grads_finite, _ = check_finite(grads)
             if not loss_finite or not grads_finite:
+                nan_count += 1
                 grads = tree_map(mx.zeros_like, grads)
                 optimizer.update(trainable, grads)
                 continue
 
+            if loss.item() == 0.0:
+                zero_loss_count += 1
+
             grads, grad_norm = clip_gradients(grads, 1.0)
             optimizer.update(trainable, grads)
-            mx.eval(backbone.parameters(), optimizer.state)
+            mx.eval(list(trainable.values()), optimizer.state)
 
             if step % 10 == 0 or step == steps - 1:
                 elapsed = time.time() - t0
@@ -797,9 +839,23 @@ def distill_backbone(backbone, specialists, combined_data,
 
             step += 1
 
+    # Validation on held-out set
+    backbone.eval()
+    val_losses = []
+    for s in val_samples:
+        ids = mx.array([s["ids"]])
+        labels = mx.array([s["labels"]])
+        logits, _ = backbone(ids, return_mtp=False)
+        vl = cross_entropy_loss(logits, labels).item()
+        if mx.isfinite(vl) and vl > 0:
+            val_losses.append(vl)
+
     backbone.freeze()
     final_loss = loss.item() if step > 0 else float('inf')
-    print(f"[distill] Complete ({step} steps) final_loss={final_loss:.4f}")
+    elapsed = time.time() - t_start
+    val_loss_str = f"val_loss={sum(val_losses)/len(val_losses):.4f}" if val_losses else "val_loss=N/A"
+    print(f"[distill] Complete ({step} steps) final_loss={final_loss:.4f} "
+          f"{val_loss_str} ({elapsed:.0f}s) nan={nan_count} zero_loss={zero_loss_count}")
     return final_loss
 
 

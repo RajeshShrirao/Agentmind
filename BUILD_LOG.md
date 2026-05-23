@@ -891,3 +891,72 @@ python3 -c "from training_orchestrator import run_round; ..."
 → Returns: {adapter_path, distill_loss}
 ```
 
+---
+
+## `[uncommitted]` — 2026-05-23
+
+**Performance optimization + observability sprint (train.py, router.py, prepare_data/).**
+
+Three performance bugs fixed after the first real apprenticeship run exposed them:
+
+### 1. `mx.eval` materializing 147M frozen params every step
+
+In `train_specialist()`, `mx.eval(backbone.parameters(), optimizer.state)` forced MLX to
+materialize ALL 147M backbone weights to RAM every training step — including the frozen
+base weights that hadn't changed. Only the 2.36M LoRA A/B matrices were updated.
+
+**Fix:** `mx.eval(list(trainable.values()), optimizer.state)` — evaluates only the ~74 LoRA
+tensors. Same fix applied in `train()` main loop, `distill_backbone()`, and `apprentice.py`.
+Throughput jumped from ~50 tok/s to ~250 tok/s.
+
+### 2. Tok/s display off by 50× in specialist/distill loops
+
+`train_specialist()` logged every 50 steps but divided 1 step's tokens by 50 steps' time:
+```python
+tok_per_sec = (input_ids.shape[1]) / (time.time() - t0 + 1e-8)  # ← wrong
+```
+**Fix:** `input_ids.shape[1] * 50` (the report interval). Same bug fixed in `apprentice.py`
+(multiplied by `log_every`).
+
+### 3. Router training: 200K backbone forward passes → 1000
+
+`TaskRouter.train()` was iterating 200 epochs × 1000 samples = 200,000 full 147M backbone
+forward passes — each one recomputing hidden states for the same frozen backbone.
+
+**Fix:** Cache backbone hidden states in a single pass (1000 forward passes), then train
+the 66K-param classifier on cached `(1, 1024)` tensors. Cut training from ~hours to ~minutes.
+Added per-domain accuracy breakdown to detect when the router isn't learning.
+
+### Observability additions
+
+- **Hardware monitoring**: New `monitor.py` utility that reads `vm_stat` and `sysctl` to
+  report CPU%, RAM%, and swap usage. Snapshots printed at every phase boundary in the
+  orchestrator and data preparation pipeline. Helps correlate lag with swap pressure
+  (e.g., RAM at 95% + swap at 1.8GB = macOS paging to disk).
+- **Validation loss**: `train_specialist()` and `distill_backbone()` now hold out 5% of
+  data, evaluate loss after training, and report `val_loss` in the completion line.
+- **NaN/zero-loss counters**: Both training functions track and report how many steps had
+  NaN gradients or zero-loss (empty mask) batches.
+- **Phase-level wall timing**: All training functions and the orchestrator report total
+  elapsed time per phase and overall wall time.
+- **Per-dataset timing in prepare_data/**: Each HF dataset download now shows duration and
+  throughput (`samples/s`). Conversion yield rate (`2741/3000 valid, 91% yield`).
+  Synthetic generation shows progress every 10% with running throughput.
+  Output file size printed alongside sample counts.
+- **Router accuracy per domain**: Training log shows `[tool_caller=18%, planner=19%, ...]`
+  so you can immediately see which domains the classifier confuses.
+- **Cosine gradient clipping**: Fixed RMS calculation — gradient normalization now uses
+  `sqrt(sum(g_i²))` instead of per-parameter RMS. Clipping consistent at max_norm=1.0.
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `train.py` | `mx.eval` fix, tok/s fix, val loss, NaN/zero counters, timing |
+| `apprentice.py` | `mx.eval` fix, tok/s fix (same pattern) |
+| `router.py` | Cached hidden states, per-domain accuracy, timing |
+| `training_orchestrator.py` | Hardware snapshots, total wall time |
+| `monitor.py` | **New** — CPU%/RAM%/swap via vm_stat + sysctl |
+| `prepare_data/base.py` | HW snapshots, per-dataset timing, yield rates |
+| `prepare_data/*.py` (4 files) | Timing, HW snapshots, file size, progress intervals |
+

@@ -43,6 +43,14 @@ class LocalAttentionBlock(nn.Module):
         H, Hd = self.n_heads, self.head_dim
         W = self.window
 
+        # Cache mask — L is fixed for a given training run
+        if not hasattr(self, '_cached_mask') or self._cached_L != L:
+            pos = mx.arange(L)
+            mask = (pos[None, :] - pos[:, None]) >= 0   # causal
+            local = (pos[None, :] - pos[:, None]) < W    # window
+            self._cached_mask = mx.where(mask & local, 0.0, float('-inf'))
+            self._cached_L = L
+
         q = self.q_proj(x).reshape(B, L, H, Hd).transpose(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, L, H, Hd).transpose(0, 2, 1, 3)
         v = self.v_proj(x).reshape(B, L, H, Hd).transpose(0, 2, 1, 3)
@@ -53,16 +61,8 @@ class LocalAttentionBlock(nn.Module):
 
         scale = math.sqrt(Hd)
 
-        # Local window mask: each token attends only to last W positions
-        # Build position matrix
-        pos = mx.arange(L)
-        mask = (pos[None, :] - pos[:, None]) >= 0  # causal
-        local = (pos[None, :] - pos[:, None]) < W   # window
-        attn_mask = mask & local                     # [L, L]
-        attn_mask = mx.where(attn_mask, 0.0, float('-inf'))
-
         scores = (q @ k.transpose(0, 1, 3, 2)) / scale  # [B,H,L,L]
-        scores = scores + attn_mask[None, None]
+        scores = scores + self._cached_mask[None, None]
         attn = mx.softmax(scores, axis=-1)
 
         out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, L, -1)

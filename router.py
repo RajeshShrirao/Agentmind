@@ -1,4 +1,4 @@
-import json
+import json, random
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
@@ -47,48 +47,82 @@ class TaskRouter(nn.Module):
     def train(self, dataset, backbone, tokenizer=None, steps=200, lr=1e-3):
         backbone.eval()
         backbone.freeze()
-        optimizer = optim.Adam(learning_rate=lr)
-        loss_fn = nn.losses.cross_entropy
 
         domain_to_id = {name: i for i, name in enumerate(self.domain_names)}
 
+        # ── Cache hidden states: one 147M forward pass per sample ──
+        cached = []
+        for sample in dataset:
+            domain = sample["domain"]
+            messages = sample["messages"]
+            label = domain_to_id[domain]
+
+            if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+                if tokenizer is None:
+                    raise ValueError(
+                        "tokenizer required when messages are raw dicts; "
+                        "pass a SentencePiece tokenizer with .encode(text, add_bos=True)"
+                    )
+                text = self._format_messages(messages)
+                token_ids = tokenizer.encode(text, add_bos=True)
+            else:
+                token_ids = messages
+
+            ids = mx.array([token_ids])
+            backbone.forward_with_state(ids, {})
+            # cache only last-token hidden state — (1, d_model), ~4KB per sample
+            cached.append((backbone.last_hidden[:, -1, :], label, domain))
+
+        print(f"  Cached {len(cached)} hidden states (one forward pass each)")
+
+        # ── Train classifier on cached states ──
+        optimizer = optim.Adam(learning_rate=lr)
+        loss_fn = nn.losses.cross_entropy
+        t_start = time.time()
+
+        domain_names = self.domain_names
+        per_domain = {d: {"correct": 0, "total": 0} for d in domain_names}
+
         for step in range(steps):
+            random.shuffle(cached)
             total_loss = 0.0
-            for sample in dataset:
-                domain = sample["domain"]
-                messages = sample["messages"]
-                label = mx.array([domain_to_id[domain]])
 
-                if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-                    if tokenizer is None:
-                        raise ValueError(
-                            "tokenizer required when messages are raw dicts; "
-                            "pass a SentencePiece tokenizer with .encode(text, add_bos=True)"
-                        )
-                    text = self._format_messages(messages)
-                    token_ids = tokenizer.encode(text, add_bos=True)
-                else:
-                    token_ids = messages
-
-                ids = mx.array([token_ids])
-                backbone.forward_with_state(ids, {})
-                hidden = backbone.last_hidden
+            for hidden, label, domain in cached:
+                label_arr = mx.array([label])
 
                 def compute_loss(h):
-                    logits = self(h)
-                    return loss_fn(logits, label, reduction="mean")
+                    logits = self.classifier(h)
+                    return loss_fn(logits, label_arr, reduction="mean")
 
-                loss_and_grad = nn.value_and_grad(self, compute_loss)
-                loss, grads = loss_and_grad(hidden)
+                loss, grads = nn.value_and_grad(self, compute_loss)(hidden)
                 optimizer.update(self, grads)
                 mx.eval(self.parameters(), optimizer.state)
 
                 total_loss += loss.item()
+                pred = mx.argmax(self.classifier(hidden), axis=-1).item()
+                per_domain[domain]["correct"] += (pred == label)
+                per_domain[domain]["total"] += 1
 
             if step % 50 == 0 or step == steps - 1:
-                avg_loss = total_loss / len(dataset)
-                print(f"[router] step {step}/{steps}  loss={avg_loss:.4f}")
+                avg_loss = total_loss / len(cached)
+                total_correct = sum(v["correct"] for v in per_domain.values())
+                total_all = sum(v["total"] for v in per_domain.values())
+                acc = total_correct / total_all * 100
+                per_domain_acc = ", ".join(
+                    f"{d}={v['correct']/v['total']*100:.0f}%"
+                    for d, v in per_domain.items()
+                )
+                print(f"[router] step {step}/{steps}  loss={avg_loss:.4f}  acc={acc:.1f}%  [{per_domain_acc}]")
 
+        elapsed = time.time() - t_start
+        total_correct = sum(v["correct"] for v in per_domain.values())
+        total_all = sum(v["total"] for v in per_domain.values())
+        per_domain_acc = ", ".join(
+            f"{d}={v['correct']/v['total']*100:.0f}%"
+            for d, v in per_domain.items()
+        )
+        print(f"[router] Complete ({steps} steps, {elapsed:.0f}s) "
+              f"acc={total_correct/total_all*100:.1f}%  [{per_domain_acc}]")
         return self
 
     def save(self, path):

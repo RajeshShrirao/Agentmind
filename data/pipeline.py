@@ -13,6 +13,7 @@ class AgentDataset:
         self.ids_array = None
         self.labels_array = None
         self.latent_stage = 1
+        self._cache = {}
 
         if pretokenized:
             # Load pre-tokenized .npz files
@@ -94,6 +95,10 @@ class AgentDataset:
             labels = self.labels_array[idx].tolist()
             return ids, labels
 
+        cache_key = (idx, self.latent_stage)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         import copy
         from model.latent import inject_latent_tokens
 
@@ -106,6 +111,7 @@ class AgentDataset:
         ids = ids[:self.cfg.max_seq_len]
         labels = self._make_labels(ids, sample)[:self.cfg.max_seq_len]
 
+        self._cache[cache_key] = (ids, labels)
         return ids, labels
 
 def collate_batch(samples: list, pad_id: int = 0, max_len: int = 2048) -> tuple:

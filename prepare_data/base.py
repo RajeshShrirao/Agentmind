@@ -1,11 +1,9 @@
-import os
-import json
-import random
-import logging
-import time
+import os, json, random, logging, time
 import os as _os
+from pathlib import Path
 
 from datasets import load_dataset
+from monitor import print_hw, hw_summary
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +53,9 @@ def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=No
     If the dataset is unavailable, logs a warning and yields nothing.
     config: optional sub-config name for datasets with multiple configs.
     """
+    t0 = time.time()
     print(f"    [HF] Loading {name} (config={config}, split={split}, max_samples={max_samples})...")
+    print(f"    [HF] {hw_summary()}")
     try:
         load_kwargs = {
             "path": name,
@@ -67,14 +67,20 @@ def download_hf_dataset(name, split, filter_fn=None, max_samples=None, config=No
             load_kwargs["name"] = config
         load_kwargs.update(kwargs)
         ds = load_dataset(**load_kwargs)
-        print(f"    [HF] {name} loaded, iterating...")
     except Exception as e:
-        print(f"    [HF] FAILED to load {name} ({split}): {e}")
+        elapsed = time.time() - t0
+        print(f"    [HF] FAILED to load {name} ({split}) after {elapsed:.0f}s: {e}")
         logger.warning(f"Cannot load {name} ({split}): {e}")
         return
 
-    yield from _safe_iter_dataset(ds, name, max_samples, filter_fn)
-    print(f"    [HF] {name} done ({max_samples or 'all'} samples processed)")
+    print(f"    [HF] {name} loaded, iterating...")
+    count = 0
+    for sample in _safe_iter_dataset(ds, name, max_samples, filter_fn):
+        count += 1
+        yield sample
+
+    elapsed = time.time() - t0
+    print(f"    [HF] {name} done: {count} samples in {elapsed:.0f}s ({count/elapsed:.1f}/s)" if elapsed > 1 else f"    [HF] {name} done: {count} samples")
 
 
 def convert_to_apprentice(raw_samples, domain, format_fn):
@@ -85,16 +91,24 @@ def convert_to_apprentice(raw_samples, domain, format_fn):
     """
     if raw_samples is None:
         return
+    total = 0
+    valid = 0
     for raw in raw_samples:
+        total += 1
         try:
             result = format_fn(raw)
             if result is None:
                 continue
             result["domain"] = domain
+            valid += 1
             yield result
         except Exception as e:
             logger.debug(f"Format conversion skipped: {e}")
             continue
+    # Report yield rate if enough samples were processed
+    if total > 100:
+        pct = 100 * valid // max(total, 1)
+        print(f"    [convert] {valid}/{total} valid ({pct}% yield)")
 
 
 def _inject_adversarial_noise(messages, rate):
@@ -131,6 +145,9 @@ def combine(hf_samples, synthetic_fn, n_synthetic, adversarial_rate, domain="", 
 
     Returns (all_samples, n_hf, n_synth, n_adversarial, n_latent).
     """
+    t0 = time.time()
+
+    # ── Collect HF samples ──
     try:
         hf_list = list(hf_samples) if hf_samples is not None else []
     except Exception as e:
@@ -138,6 +155,7 @@ def combine(hf_samples, synthetic_fn, n_synthetic, adversarial_rate, domain="", 
         hf_list = []
     n_hf_raw = len(hf_list)
 
+    # ── Inject adversarial noise into HF subset ──
     hf_adversarial = 0
     for i in range(len(hf_list)):
         old = hf_list[i].get("messages", [{}])[-1].get("content", "")
@@ -148,22 +166,32 @@ def combine(hf_samples, synthetic_fn, n_synthetic, adversarial_rate, domain="", 
         if old != new:
             hf_adversarial += 1
 
+    # ── Generate synthetic ──
     synth_list = []
     synth_adversarial = 0
+    report_interval = max(1, n_synthetic // 10)
     for i in range(n_synthetic):
-        if i > 0 and i % 5000 == 0:
-            print(f"    [synth] {i}/{n_synthetic} generated...")
+        if i > 0 and i % report_interval == 0:
+            pct = 100 * i // n_synthetic
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else 0
+            print(f"    [synth] {i}/{n_synthetic} ({pct}%) {rate:.0f} samples/s")
         sample = synthetic_fn(adversarial_rate=adversarial_rate, latent_rate=latent_rate)
         synth_list.append(sample)
         content = json.dumps(sample.get("messages", ""))
         if "<|scratch|>" in content:
             synth_adversarial += 1
 
+    # ── Merge & shuffle ──
     all_samples = hf_list + synth_list
     random.shuffle(all_samples)
 
     n_latent = _count_latent(all_samples)
     n_adversarial = hf_adversarial + synth_adversarial
+    elapsed = time.time() - t0
+
+    print(f"    [combine] {len(all_samples)} samples ({len(hf_list)} HF + {len(synth_list)} synth) "
+          f"in {elapsed:.0f}s | adv={n_adversarial} latent={n_latent}")
 
     return all_samples, len(hf_list), len(synth_list), n_adversarial, n_latent
 

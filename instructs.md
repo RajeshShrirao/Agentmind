@@ -239,23 +239,33 @@ class TaskRouter(nn.Module):
         self.domain_names = domain_names or []
     
     def __call__(self, hidden_state):
-        # hidden_state: [B, L, d_model] — pool over sequence dim
-        pooled = mx.mean(hidden_state, axis=1)  # [B, d_model]
-        return self.classifier(pooled)  # [B, n_domains]
+        # hidden_state: [B, L, d_model] — use LAST position, not mean-pool.
+        # Design doc (Inference Flow section) and agent.py both extract the last
+        # hidden position for routing: backbone.last_hidden[:, -1, :]. Using mean
+        # would create a train/infer mismatch — router trained on mean but queried
+        # at inference with the last token. Always use last position.
+        if hidden_state.ndim == 3:
+            last = hidden_state[:, -1, :]  # [B, d_model]
+        else:
+            last = hidden_state             # already [B, d_model]
+        return self.classifier(last)  # [B, n_domains]
     
     def select_expert(self, hidden_state, threshold=0.6):
+        # Pass the full hidden_state tensor — __call__ extracts the last position.
         logits = self(hidden_state)
         probs = mx.softmax(logits, axis=-1)
         if mx.max(probs).item() < threshold:
             return "tool_caller"  # fallback
         return self.domain_names[mx.argmax(logits, axis=-1).item()]
 
-    def train(self, dataset, backbone, steps=200, lr=1e-3):
+    def train(self, dataset, backbone, tokenizer=None, steps=200, lr=1e-3):
         # dataset: list of {"domain": str, "messages": [...]}
         # For each sample:
         #   1. Tokenize messages
-        #   2. backbone forward (no grad, eval mode) → last_hidden
-        #   3. router(hidden) → domain_logits
+        #   2. backbone.forward_with_state(ids, {}) → backbone.last_hidden
+        #      Note: backbone.last_hidden is [B, L, d_model]. Pass the full tensor;
+        #      __call__ will extract the last position.
+        #   3. router(backbone.last_hidden) → domain_logits
         #   4. CE(domain_logits, domain_label)
         #   5. grad update router only (backbone frozen)
 
@@ -264,17 +274,22 @@ python -c "
 from router import TaskRouter
 import mlx.core as mx
 router = TaskRouter(d_model=1024, n_domains=5, domain_names=['tool_caller','planner','recovery','code','research'])
-hidden = mx.ones((1, 16, 1024))
-logits = router(hidden)
-print('Router output shape:', logits.shape)
+hidden = mx.ones((1, 16, 1024))  # [B=1, L=16, d_model=1024]
+logits = router(hidden)           # internally uses hidden[:, -1, :]
+print('Router output shape:', logits.shape)  # expected: (1, 5)
 expert = router.select_expert(hidden)
 print('Selected expert:', expert)
 print('Router params: ~65K (verify: sum of param sizes)')
 "
 
+# Verify last-position extraction is consistent:
+# - router.__call__: uses hidden[:, -1, :]
+# - agent.py _select_specialist: self.router(hidden_state[:, -1:, :]) — passes [B,1,D]
+#   both collapse to the same last token representation. No pooling mismatch.
+
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: router as 65K classifier, hidden→domain mapping, fallback threshold rationale, MLX implementation notes
-- 💾 **Commit** with message: `router.py — TaskRouter for apprentice dispatch (65K params, threshold-based fallback)`
+- 📝 **Update BUILD_LOG.md** — diary entry: why last-position (not mean-pool) for routing, train/infer parity, 65K classifier, fallback threshold rationale
+- 💾 **Commit** with message: `router.py — TaskRouter for apprentice dispatch (last-position hidden, 65K params, threshold-based fallback)`
 ```
 
 ---
@@ -397,21 +412,33 @@ After it passes:
 Read the existing train.py. It currently has a monolithic train() function.
 Refactor it into two callable entry points for the training_orchestrator:
 
-1. train_specialist(backbone, domain_dataset, domain_name, steps=500, lr=2e-4, seq_len=256) -> adapter_weights
+1. train_specialist(backbone, domain_dataset, domain_name, steps=500, lr=2e-4, seq_len=256, latent_stage=1) -> adapter_weights
    - Wraps backbone in CognitiveApprentice for the given domain
-   - Trains only the LoRA adapter (backbone frozen)
+   - Trains ONLY the LoRA adapter (backbone stays FROZEN throughout)
    - Returns the trained adapter weights (LoRA A/B matrices)
    - Uses existing: cross_entropy_loss, clip_gradients, CosineWarmupScheduler
    - Per-step: latent stage injection via inject_latent_tokens + latent_loss_mask
 
+   ⚠️ MTP DISABLED during specialist training:
+   Specialist adapters are 2.36M params — the backbone MTP head (4 × 32K vocab) is larger
+   than the adapter. More importantly, MTP runs on the backbone, which is FROZEN here.
+   Never set return_mtp=True inside train_specialist. Add an explicit assertion:
+       assert not return_mtp_in_specialist, "MTP must not run during specialist training — backbone is frozen"
+   MTP only fires during distill_backbone() when the backbone is unfrozen.
+   Add a clear comment to this effect in the code.
+
+   Latent stage is passed in from the orchestrator (not derived from step count).
+   The orchestrator maps per-round stages explicitly (see training_orchestrator.py).
+
 2. distill_backbone(backbone, specialists, combined_data, beta=0.5, mtp_weight=0.2, steps=50) -> None
    - Unfreezes backbone
    - For each batch: 
-     - backbone forward with return_mtp=True
-     - specialist forward for correct domain
+     - backbone forward with return_mtp=True  ← MTP ENABLED here (backbone unfrozen)
+     - specialist forward for correct domain (backbone frozen for each specialist forward)
      - loss = CE(backbone, labels) + beta * KL(backbone || specialist) + mtp_weight * MTP_loss
+       MTP starts after step 20 for stability (warm-up before applying MTP auxiliary loss)
    - Gradient clipping, NaN recovery (same as existing)
-   - Freezes backbone
+   - Freezes backbone after distillation
    - Uses existing: cross_entropy_loss, mtp_loss, clip_gradients, check_finite
 
 Keep the existing monolith train() function as-is for backward compatibility,
@@ -473,34 +500,81 @@ Implement training_orchestrator.py — the round management loop.
 
 It must run the full apprenticeship protocol:
 
+# Per-round latent stage mapping — explicit, from the design doc table:
+#   Round 1 (tool_caller):         latent stages 1→2 (basic tool calling, then wrap scratch in boundaries)
+#   Round 2 (planner):             latent stages 2→3 (planned trajectories, 50% CoT → latent replacement)
+#   Round 3+ (recovery/code/research): latent stage 4 (full latent — CoT removed, only think boundaries)
+# This mapping MUST be explicit in the orchestrator — do NOT derive it from global step count.
+# Pass latent_stage directly to train_specialist() for each round.
+
 ROUNDS = [
-    {"domain": "tool_caller", "file": "data/apprentice_tool_caller.jsonl", 
-     "specialist_steps": 500, "seq_len": 256, "distill_steps": 50, "adversarial": 0.3},
-    {"domain": "planner", "file": "data/apprentice_planner.jsonl",
-     "specialist_steps": 300, "seq_len": 512, "distill_steps": 50, "adversarial": 0.3},
-    {"domain": "recovery", "file": "data/apprentice_recovery.jsonl",
-     "specialist_steps": 300, "seq_len": 256, "distill_steps": 50, "adversarial": 0.4},
-    {"domain": "code", "file": "data/apprentice_code.jsonl",
-     "specialist_steps": 300, "seq_len": 512, "distill_steps": 50, "adversarial": 0.3},
-    {"domain": "research", "file": "data/apprentice_research.jsonl",
-     "specialist_steps": 300, "seq_len": 1024, "distill_steps": 50, "adversarial": 0.3},
+    {
+        "domain": "tool_caller",
+        "file": "data/apprentice_tool_caller.jsonl",
+        "specialist_steps": 500,
+        "seq_len": 256,
+        "distill_steps": 50,
+        "adversarial": 0.3,
+        "latent_stage": 1,  # Round 1: start at stage 1, curriculum advances to 2
+    },
+    {
+        "domain": "planner",
+        "file": "data/apprentice_planner.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 512,
+        "distill_steps": 50,
+        "adversarial": 0.3,
+        "latent_stage": 2,  # Round 2: start at stage 2, advances to 3
+    },
+    {
+        "domain": "recovery",
+        "file": "data/apprentice_recovery.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 256,
+        "distill_steps": 50,
+        "adversarial": 0.4,
+        "latent_stage": 4,  # Round 3+: full latent — backbone already understands silent reasoning
+    },
+    {
+        "domain": "code",
+        "file": "data/apprentice_code.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 512,
+        "distill_steps": 50,
+        "adversarial": 0.3,
+        "latent_stage": 4,  # Round 4: full latent
+    },
+    {
+        "domain": "research",
+        "file": "data/apprentice_research.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 1024,
+        "distill_steps": 50,
+        "adversarial": 0.3,
+        "latent_stage": 4,  # Round 5: full latent
+    },
 ]
 
 Then router training using data/router_training.jsonl.
 
 The orchestration:
 1. Load backbone, init, LoRA apply
-2. For each round:
-   a. Load domain dataset
-   b. train_specialist(backbone, dataset, domain) → adapter_weights
+2. For EACH round (rounds 1 through 5 — ALL of them):
+   a. Load domain dataset with correct latent_stage from ROUNDS config
+   b. train_specialist(backbone, dataset, domain, latent_stage=round_cfg["latent_stage"]) → adapter_weights
+      ↳ Backbone stays FROZEN. MTP is OFF. Latent stage from per-round config.
    c. save_adapter(adapter_weights, domain, save_dir)
-   d. Load ALL completed specialists
+   d. Load ALL completed specialists so far (including this round's new one)
    e. distill_backbone(backbone, specialists, combined_data)
+      ↳ THIS MUST HAPPEN AFTER EVERY SPECIALIST, not just round 1.
+      ↳ Design doc explicitly requires: distill after rounds 1, 2, 3, 4, 5.
+      ↳ MTP is ON during distillation (backbone unfrozen). MTP starts after distill step 20.
+      ↳ After distillation: backbone now understands N domains. Future specialists start richer.
    f. Print round summary (loss, tool_acc, interference)
 3. Train router:
    a. Load router_training.jsonl
    b. Create router model
-   c. router.train(dataset, backbone)
+   c. router.train(dataset, backbone, tokenizer=tok)
    d. Save router weights
 4. Final export: backbone + all adapters + router
 
@@ -609,8 +683,14 @@ class AgentLoop:
         self.active_adapter = None
 
     def _select_specialist(self, hidden_state):
-        logits = self.router(hidden_state[:, -1:, :])  # use last position
-        return self.router.select_expert(logits, threshold=0.6)
+        # Pass the last-position slice [B, 1, d_model] to the router.
+        # router.__call__ handles both [B, L, D] and [B, D] — it always extracts
+        # the last position. Passing [:, -1:, :] (shape [B, 1, D]) is consistent
+        # with how router.py's __call__ works and matches the design doc (last_hidden).
+        # Do NOT use mean-pooling here — that would break the train/infer parity
+        # established in router.py (see Prompt 2 reconciliation).
+        logits = self.router(hidden_state[:, -1:, :])  # [B, 1, D] → router extracts last pos
+        return self.router.select_expert(hidden_state[:, -1:, :], threshold=0.6)
 
     def _load_adapter(self, name):
         if self.active_adapter != name:

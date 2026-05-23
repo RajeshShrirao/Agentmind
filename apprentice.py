@@ -195,11 +195,11 @@ class CognitiveApprentice:
 
                 grads, grad_norm = clip_gradients(grads, grad_clip)
                 optimizer.update(trainable, grads)
-                mx.eval(self.backbone.parameters(), optimizer.state)
+                mx.eval(list(trainable.values()), optimizer.state)
                 lr_now = scheduler.step()
 
                 if step % log_every == 0 or step == steps - 1:
-                    tok_per_sec = (input_ids.shape[1]) / (time.time() - t0 + 1e-8)
+                    tok_per_sec = (input_ids.shape[1] * log_every) / (time.time() - t0 + 1e-8)
                     print(f"[{self.adapter_name}] step {step:3d}/{steps} loss {loss_val:.4f} "
                           f"lr {lr_now:.2e} grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
                     t0 = time.time()
@@ -258,7 +258,7 @@ class CognitiveApprentice:
 
                 grads, grad_norm = clip_gradients(grads, grad_clip)
                 optimizer.update(backbone_params, grads)
-                mx.eval(backbone.parameters(), optimizer.state)
+                mx.eval(list(backbone_params.values()), optimizer.state)
 
                 if step % log_every == 0 or step == steps - 1:
                     elapsed = time.time() - t0

@@ -16,8 +16,9 @@ Usage:
   python training_orchestrator.py --rounds 1-3 --resume ./checkpoints --save-dir ./checkpoints
 """
 
-import json, os, argparse, copy
+import json, os, argparse, copy, time
 from pathlib import Path
+from monitor import print_hw
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -112,6 +113,7 @@ def load_domain_data(data_path: str, backbone, latent_stage: int = 1):
     ds.latent_stage = latent_stage
     ds.ids_array = None
     ds.labels_array = None
+    ds._cache = {}
     ds.weights = {"instruction": 0.3, "tool_single": 0.3,
                   "agent_multi": 0.25, "recovery": 0.15}
 
@@ -235,6 +237,7 @@ def main():
     round_indices = parse_rounds(args.rounds)
     print(f"Rounds to run: {[i+1 for i in round_indices]}")
 
+    t_start = time.time()
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     adapters_dir = save_dir / "adapters"
@@ -273,6 +276,7 @@ def main():
         else:
             print(f"Resume dir {resume_dir} not found — starting fresh")
 
+    print_hw("start")
     # Round loop
     all_adapter_weights = {}
     completed_round_entries = []
@@ -290,6 +294,7 @@ def main():
             completed_round_entries.append(round_cfg)
             continue
 
+        print_hw(f"round {idx+1} start")
         result = run_round(
             backbone=backbone,
             domain=round_cfg["domain"],
@@ -302,6 +307,7 @@ def main():
             existing_adapters=all_adapter_weights if all_adapter_weights else None,
         )
 
+        print_hw(f"round {idx+1} end")
         distill_loss = result.get("distill_loss", "N/A")
         print(f"\n  Round {idx+1} ({round_cfg['domain']}) complete")
         print(f"    Adapter: {result['adapter_path']}")
@@ -314,6 +320,7 @@ def main():
 
         completed_round_entries.append(round_cfg)
 
+    print_hw("router")
     # Train router
     print(f"\n{'='*60}")
     print("  Training Router")
@@ -353,8 +360,11 @@ def main():
     mx.save_safetensors(str(backbone_path), dict(backbone_params))
     print(f"  Backbone saved -> {backbone_path}")
 
+    total_elapsed = time.time() - t_start
+    print_hw("end")
     print(f"\n{'='*60}")
     print(f"  Training complete. All artifacts in {save_dir}")
+    print(f"  Total wall time: {total_elapsed//60:.0f}m {total_elapsed%60:.0f}s")
     print(f"{'='*60}")
 
 

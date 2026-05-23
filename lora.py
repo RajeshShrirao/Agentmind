@@ -110,7 +110,6 @@ def save_adapter(model, adapter_name, save_dir):
     total_kb = sum(v.nbytes for v in lora_params.values()) // 1024
     print(f"[lora] Saved adapter '{adapter_name}' \u2192 {path} ({total_kb} KB)")
 
-
 def load_adapter(model, adapter_path):
     path = Path(adapter_path)
     if not path.exists():

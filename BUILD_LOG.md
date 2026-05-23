@@ -1109,7 +1109,7 @@ grep '"type":"hw"' logs/training.jsonl | python3 -m json.tool
 
 ---
 
-## `[uncommitted]` — 2026-05-23
+## `fe8d6df` — 2026-05-23
 
 **Architecture refinement (12 layers, d_state=16) + training infra overhaul + data generation toolkit.**
 

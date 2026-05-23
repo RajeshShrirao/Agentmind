@@ -137,6 +137,58 @@ def evaluate(model, val_dataset, tok, cfg, max_len: int = 512):
     return val_loss, tool_report
 
 
+def evaluate_tool_syntax(text: str) -> dict:
+    """
+    Lightweight tool-call syntax metric.
+
+    Extracts all tool calls from generated text and checks:
+      - parse_success: extracts as valid JSON
+      - malformed_json: JSON parse failure
+      - missing_name: valid JSON but no 'name' key
+      - missing_args: valid JSON but no 'args' key (or not a dict)
+
+    Returns dict with counts for each category.
+    Does NOT validate tool registry or argument types.
+    """
+    result = {
+        "parse_success": 0,
+        "malformed_json": 0,
+        "missing_name": 0,
+        "missing_args": 0,
+        "valid_tool_calls": 0,
+        "total": 0,
+    }
+
+    idx = 0
+    while True:
+        start = text.find("<|tool_call|>", idx)
+        if start == -1:
+            break
+        start += len("<|tool_call|>")
+        json_str = text[start:]
+        for boundary in ("<|observe|>", "<|end|>", "<eos>"):
+            if boundary in json_str:
+                json_str = json_str.split(boundary)[0]
+        json_str = json_str.strip()
+        result["total"] += 1
+
+        try:
+            obj = json.loads(json_str)
+            result["parse_success"] += 1
+            if not isinstance(obj.get("name"), str):
+                result["missing_name"] += 1
+            if not isinstance(obj.get("args"), dict):
+                result["missing_args"] += 1
+            if isinstance(obj.get("name"), str) and isinstance(obj.get("args"), dict):
+                result["valid_tool_calls"] += 1
+        except (json.JSONDecodeError, ValueError):
+            result["malformed_json"] += 1
+
+        idx = start + len(json_str)
+
+    return result
+
+
 def tool_call_accuracy(model, prompts: list[str], tok, cfg) -> float:
     """Legacy: kept for backward compat. Returns fraction of prompts with valid JSON."""
     results = evaluate_tool_calls(model, prompts, tok, cfg)

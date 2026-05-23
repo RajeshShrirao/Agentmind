@@ -8,10 +8,10 @@ class AgentMindConfig:
 
     # Model dimensions
     d_model: int = 1024
-    n_layers: int = 16
+    n_layers: int = 12
 
     # Mamba SSM
-    d_state: int = 64        # memory per channel (materially improves long-range retention)
+    d_state: int = 16        # memory per channel (16 is enough for procedural continuity)
     d_conv: int = 4          # causal conv kernel
     expand: int = 2          # d_inner = expand × d_model = 4096
     dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 64
@@ -19,7 +19,7 @@ class AgentMindConfig:
     # Hybrid attention
     n_heads: int = 8
     attn_window: int = 256   # local attention window
-    attn_every: int = 4      # attention layer every N blocks
+    attn_every: int = 3      # attention layer every N blocks (8 Mamba + 4 Attn with n_layers=12)
 
     # FFN (SwiGLU)
     ffn_mult: float = 8 / 3  # standard SwiGLU multiplier

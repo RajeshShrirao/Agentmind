@@ -10,7 +10,7 @@ import json, os, subprocess, argparse, urllib.request, urllib.parse
 from pathlib import Path
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from config import AgentMindConfig
 from model.agent_lm import AgentMind
@@ -247,7 +247,7 @@ def main():
         backbone_path = backbone_path / "backbone.safetensors"
     if backbone_path.exists():
         weights = mx.load(str(backbone_path))
-        backbone.update(weights)
+        backbone.update(tree_unflatten(dict(weights)))
         print(f"Backbone loaded from {backbone_path}")
     else:
         print(f"Warning: backbone not found at {backbone_path}, using random init")

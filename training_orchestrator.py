@@ -43,9 +43,10 @@ ROUNDS = [
     {
         "domain": "tool_caller",
         "file": "data/apprentice_tool_caller.jsonl",
-        "specialist_steps": 500,
+        "specialist_steps": 2000,
         "seq_len": 256,
-        "distill_steps": 50,
+        "seq_len_schedule": {0: 128, 200: 256},
+        "distill_steps": 200,
         "adversarial": 0.3,
         "latent_stage": 1,
     },
@@ -54,7 +55,8 @@ ROUNDS = [
         "file": "data/apprentice_planner.jsonl",
         "specialist_steps": 300,
         "seq_len": 512,
-        "distill_steps": 50,
+        "seq_len_schedule": None,
+        "distill_steps": 150,
         "adversarial": 0.3,
         "latent_stage": 2,
     },
@@ -63,16 +65,18 @@ ROUNDS = [
         "file": "data/apprentice_recovery.jsonl",
         "specialist_steps": 300,
         "seq_len": 256,
-        "distill_steps": 50,
+        "seq_len_schedule": {0: 128, 150: 256},
+        "distill_steps": 150,
         "adversarial": 0.4,
-        "latent_stage": 4,
+        "latent_stage": 2,
     },
     {
         "domain": "code",
         "file": "data/apprentice_code.jsonl",
         "specialist_steps": 300,
         "seq_len": 512,
-        "distill_steps": 50,
+        "seq_len_schedule": None,
+        "distill_steps": 150,
         "adversarial": 0.3,
         "latent_stage": 4,
     },
@@ -81,7 +85,8 @@ ROUNDS = [
         "file": "data/apprentice_research.jsonl",
         "specialist_steps": 300,
         "seq_len": 1024,
-        "distill_steps": 50,
+        "seq_len_schedule": None,
+        "distill_steps": 150,
         "adversarial": 0.3,
         "latent_stage": 4,
     },
@@ -154,6 +159,7 @@ def load_adapter_weights(adapter_path: str) -> dict:
 def run_round(backbone, domain: str, data_path: str,
               specialist_steps: int, distill_steps: int, save_dir: str,
               seq_len: int = 256, latent_stage: int = 1,
+              seq_len_schedule: dict = None,
               existing_adapters: dict = None) -> dict:
     """
     Run a single apprenticeship round.
@@ -187,7 +193,8 @@ def run_round(backbone, domain: str, data_path: str,
 
     adapter_weights = train_specialist(
         backbone, dataset, domain,
-        steps=specialist_steps, seq_len=seq_len, latent_stage=latent_stage
+        steps=specialist_steps, seq_len=seq_len, latent_stage=latent_stage,
+        seq_len_schedule=seq_len_schedule, syntax_aux_weight=0.2
     )
 
     # 4. Save adapter
@@ -208,11 +215,13 @@ def run_round(backbone, domain: str, data_path: str,
     # 7. Reset LoRA so distillation doesn't start from specialist weights
     reset_adapter(backbone)
 
-    # 8. Distill backbone
-    print(f"\n  Distilling backbone ({distill_steps} steps, seq_len={seq_len}, latent_stage={latent_stage})")
+    # 8. Distill backbone with domain seq_len (half for RAM safety on large domains)
+    distill_seq_len = min(seq_len, 512)
+    print(f"\n  Distilling backbone ({distill_steps} steps, seq_len={distill_seq_len}, latent_stage={latent_stage})")
     final_loss = distill_backbone(
         backbone, specialists, combined,
-        steps=distill_steps, seq_len=seq_len, latent_stage=latent_stage
+        steps=distill_steps, seq_len=distill_seq_len, latent_stage=latent_stage,
+        mtp_weight=0.0
     )
 
     return {
@@ -310,6 +319,7 @@ def main():
             save_dir=str(adapters_dir),
             seq_len=round_cfg["seq_len"],
             latent_stage=round_cfg["latent_stage"],
+            seq_len_schedule=round_cfg.get("seq_len_schedule"),
             existing_adapters=all_adapter_weights if all_adapter_weights else None,
         )
 
@@ -328,35 +338,40 @@ def main():
 
         completed_round_entries.append(round_cfg)
 
+    # Router: requires ≥3 specialists before hidden-state manifold is separable
     log.phase("router", "start")
     print_hw("router")
-    # Train router
-    print(f"\n{'='*60}")
-    print("  Training Router")
-    print(f"{'='*60}")
-
-    domain_names = [r["domain"] for r in ROUNDS]
-    router = TaskRouter(
-        d_model=cfg.d_model,
-        hidden=64,
-        n_domains=len(domain_names),
-        domain_names=domain_names,
-    )
-
-    router_data_path = "data/router_training.jsonl"
-    if os.path.exists(router_data_path):
-        router_data = []
-        with open(router_data_path) as f:
-            for line in f:
-                router_data.append(json.loads(line.strip()))
-        print(f"  Loaded {len(router_data)} router training samples")
-
-        router.train(router_data, backbone, tokenizer=tok, steps=200, lr=1e-3)
-
-        router_save_path = str(save_dir / "router")
-        router.save(router_save_path)
+    n_completed = len(all_adapter_weights)
+    if n_completed < 3:
+        print(f"\n  Skipping router training — only {n_completed} specialists exist (need ≥3)")
+        log.phase("router", "skipped", n_completed=n_completed)
     else:
-        print(f"  Warning: {router_data_path} not found — skipping router training")
+        print(f"\n{'='*60}")
+        print(f"  Training Router ({n_completed} specialsts)")
+        print(f"{'='*60}")
+
+        domain_names = [r["domain"] for r in ROUNDS]
+        router = TaskRouter(
+            d_model=cfg.d_model,
+            hidden=64,
+            n_domains=len(domain_names),
+            domain_names=domain_names,
+        )
+
+        router_data_path = "data/router_training.jsonl"
+        if os.path.exists(router_data_path):
+            router_data = []
+            with open(router_data_path) as f:
+                for line in f:
+                    router_data.append(json.loads(line.strip()))
+            print(f"  Loaded {len(router_data)} router training samples")
+
+            router.train(router_data, backbone, tokenizer=tok, steps=200, lr=1e-3)
+
+            router_save_path = str(save_dir / "router")
+            router.save(router_save_path)
+        else:
+            print(f"  Warning: {router_data_path} not found — skipping router training")
 
     log.phase("router", "complete")
 

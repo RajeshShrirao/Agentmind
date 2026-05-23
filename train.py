@@ -29,22 +29,213 @@ TRAIN_CFG = dict(
     grad_clip     = 1.0,
     batch_size    = 1,
     grad_accum    = 8,
-    seq_len       = 2048,
+    seq_len       = 512,
     lora_rank     = 16,
     lora_alpha    = 32.0,
     eval_every    = 500,
     save_every    = 200,
-    save_dir      = "/Volumes/New Volume/checkpoints",
+    save_dir      = "/Users/rajeshshrirao/Desktop/Passion-projects/Agentmind/checkpoints",
     use_mtp       = False,
     mtp_weight    = 0.2,
     mtp_start     = 500,
     latent_stage  = 1,
-    seq_len_schedule = {0: 256, 500: 512, 1500: 1024},
+    seq_len_schedule = {0: 128, 800: 256, 2000: 512},
 )
+
+# ── Protocol debugging helpers ────────────────────────────
+
+PROSE_PATTERNS = [
+    "let me", "i'll", "i will", "here are", "here is", "i can",
+    "let's", "sure", "okay", "ok", "first", "the result", "the tool",
+    "task completed", "the output", "i have", "i found", "searching",
+    "looking", "checking", "running", "using", "getting",
+]
+
+
+def analyze_protocol(text: str) -> dict:
+    """Analyze generated text for protocol transition behavior."""
+    result = {
+        "contains_tool_call_token": False,
+        "first_tool_call_position": -1,
+        "contains_open_brace": False,
+        "contains_close_brace": False,
+        "contains_name_key": False,
+        "contains_args_key": False,
+        "balanced_braces": False,
+        "balanced_quotes": False,
+        "prose_before_tool_call": 0,
+    }
+
+    idx = text.find("<|tool_call|>")
+    if idx != -1:
+        result["contains_tool_call_token"] = True
+        result["first_tool_call_position"] = idx
+        result["prose_before_tool_call"] = len(text[:idx].split())
+        json_part = text[idx + len("<|tool_call|>"):]
+        for boundary in ("<|observe|>", "<|end|>", "<eos>"):
+            if boundary in json_part:
+                json_part = json_part.split(boundary)[0]
+        result["contains_open_brace"] = "{" in json_part
+        result["contains_close_brace"] = "}" in json_part
+        result["contains_name_key"] = '"name"' in json_part
+        result["contains_args_key"] = '"args"' in json_part
+        result["balanced_braces"] = json_part.count("{") == json_part.count("}")
+        result["balanced_quotes"] = json_part.count('"') % 2 == 0
+    else:
+        result["prose_before_tool_call"] = len(text.split())
+
+    return result
+
+
+def detect_prose_contamination(text: str) -> dict:
+    """Detect prose narration that may dominate before tool mode activates."""
+    result = {
+        "prose_before_tool_call": 0,
+        "matched_prose_patterns": [],
+        "total_token_count": len(text.split()),
+    }
+    idx = text.find("<|tool_call|>")
+    if idx != -1:
+        before = text[:idx].lower()
+        result["prose_before_tool_call"] = len(before.split())
+    else:
+        before = text.lower()
+        result["prose_before_tool_call"] = len(before.split())
+
+    for pattern in PROSE_PATTERNS:
+        if pattern in before:
+            result["matched_prose_patterns"].append(pattern)
+
+    return result
+
+
+def debug_generation(backbone, tok, cfg, prompt_ids_in: list[int] = None,
+                     max_new_tokens: int = 80, repetition_penalty: float = 1.2) -> dict:
+    """Run a greedy decode and return full debug info.
+
+    Uses token IDs directly so the prompt matches training distribution.
+    Applies repetition penalty to suppress degenerate loops.
+    """
+    if prompt_ids_in is None:
+        prompt_ids_in = [cfg.bos_id, cfg.user_id] + tok.encode(
+            "Search arxiv for recent Mamba papers"
+        ) + [cfg.assistant_id]
+    prompt_ids = mx.array([prompt_ids_in])
+
+    h_states = {}
+    out_ids = []
+    recent = []
+
+    for _ in range(max_new_tokens):
+        logits_t, h_states = backbone.forward_with_state(
+            mx.array([[out_ids[-1]]]) if out_ids else prompt_ids,
+            h_states if out_ids else h_states,
+        )
+        logit = logits_t[0, -1]
+        if repetition_penalty > 1.0:
+            for r in set(recent[-32:]):
+                if logit[r] > 0:
+                    logit[r] /= repetition_penalty
+                else:
+                    logit[r] *= repetition_penalty
+        ntok = mx.argmax(logit).item()
+        out_ids.append(ntok)
+        recent.append(ntok)
+        if ntok == cfg.eos_id:
+            break
+
+    decoded = tok.decode(out_ids)
+    protocol = analyze_protocol(decoded)
+    prose = detect_prose_contamination(decoded)
+
+    return {
+        "raw_output": decoded,
+        "protocol": protocol,
+        "prose": prose,
+        "has_tool_call": protocol["contains_tool_call_token"],
+    }
+
+
+def print_debug_generation(step: int, domain: str, result: dict):
+    """Print full debug generation trace."""
+    print()
+    print("=" * 55)
+    print(f"[DEBUG GENERATION] step {step}  ({domain})")
+    print("=" * 55)
+    print("OUTPUT:")
+    print(result["raw_output"])
+    print("---")
+    p = result["protocol"]
+    pr = result["prose"]
+    print(f"[PROTO] tool_call_token={p['contains_tool_call_token']} "
+          f"pos={p['first_tool_call_position']}")
+    print(f"[PROTO] open_brace={p['contains_open_brace']} "
+          f"close_brace={p['contains_close_brace']} "
+          f"balanced={p['balanced_braces']}")
+    print(f"[PROTO] name_key={p['contains_name_key']} "
+          f"args_key={p['contains_args_key']} "
+          f"balanced_quotes={p['balanced_quotes']}")
+    print(f"[PROSE] prose_before_tool_call={p['prose_before_tool_call']} "
+          f"patterns={pr['matched_prose_patterns']}")
+    print("=" * 55)
+    print()
+
+
+# ── Syntax auxiliary loss ──────────────────────────────────
+
+def compute_syntax_aux_loss(targets: mx.array, tok, cfg, weight: float = 0.05) -> mx.array:
+    """
+    Lightweight structural heuristic for tool-call syntax.
+
+    Checks decoded target tokens for:
+      - Balanced braces  { }
+      - Balanced quotes  "
+      - Presence of "name" and "args" keys
+
+    Returns a scalar penalty added to the main loss.
+    Only activates when <|tool_call|> tokens are present in the target.
+    """
+    if not hasattr(tok, 'decode'):
+        return mx.array(0.0)
+
+    target_list = [int(t) for t in targets.flatten().tolist() if int(t) != -100]
+
+    if not target_list:
+        return mx.array(0.0)
+
+    # Quick check: tool_call_id present?
+    if cfg.tool_call_id not in target_list:
+        return mx.array(0.0)
+
+    decoded = tok.decode(target_list)
+    idx = decoded.find("<|tool_call|>")
+    if idx == -1:
+        return mx.array(0.0)
+
+    json_str = decoded[idx + len("<|tool_call|>"):]
+    for boundary in ("<|observe|>", "<|end|>", "<eos>"):
+        if boundary in json_str:
+            json_str = json_str.split(boundary)[0]
+
+    penalty = 0.0
+    braces = json_str.count("{") + json_str.count("}")
+    quotes = json_str.count('"')
+
+    if braces % 2 != 0:
+        penalty += 0.1
+    if quotes % 2 != 0:
+        penalty += 0.05
+    if '"name"' not in json_str:
+        penalty += 0.2
+    if '"args"' not in json_str:
+        penalty += 0.2
+
+    return mx.array(penalty * weight)
+
 
 # ── Loss ──────────────────────────────────────────────────
 
-def cross_entropy_loss(logits, targets):
+def cross_entropy_loss(logits, targets, boundary_weight: float = 0.0, boundary_ids: set = None):
     # Shift logits and targets for next-token prediction
     logits = logits[:, :-1, :]
     targets = targets[:, 1:]
@@ -53,7 +244,14 @@ def cross_entropy_loss(logits, targets):
     flat_targets = targets.reshape(-1)
     mask = (flat_targets != -100).astype(mx.float32)
     loss = nn.losses.cross_entropy(flat_logits, mx.maximum(flat_targets, 0), reduction='none')
-    return (loss * mask).sum() / (mask.sum() + 1e-8)
+    weighted_loss = loss * mask
+    if boundary_weight > 0.0 and boundary_ids:
+        boundary_mask = mx.zeros_like(mask)
+        for tid in boundary_ids:
+            boundary_mask = mx.maximum(boundary_mask, (flat_targets == tid).astype(mx.float32))
+        boundary_mask = boundary_mask * mask
+        weighted_loss = weighted_loss * (1.0 + boundary_mask * boundary_weight)
+    return weighted_loss.sum() / (mask.sum() + 1e-8)
 
 # ── Gradient clipping ─────────────────────────────────────
 
@@ -561,7 +759,8 @@ def train():
 
 
 def train_specialist(backbone, domain_dataset, domain_name,
-                     steps=500, lr=2e-4, seq_len=256, latent_stage=1):
+                     steps=500, lr=2e-4, seq_len=256, latent_stage=1,
+                     seq_len_schedule=None, syntax_aux_weight=0.05):
     """
     Train a LoRA specialist adapter on a single domain.
 
@@ -570,6 +769,11 @@ def train_specialist(backbone, domain_dataset, domain_name,
       - The backbone MTP head (4 x 32K vocab) is larger than the adapter
       - MTP runs on the backbone, which is frozen here
       - Enabling it would waste compute on zero-gradient backbone params
+
+    If syntax_aux_weight > 0, a lightweight structural heuristic is added
+    to the loss for samples containing <|tool_call|> tokens. This encourages
+    balanced braces, quote completion, and required key presence without
+    constrained decoding or RL.
     """
     # Guard: MTP must never fire when the backbone is frozen
     _mtp_guard = False
@@ -613,11 +817,13 @@ def train_specialist(backbone, domain_dataset, domain_name,
                 mod._no_grad.discard('B')
 
     optimizer = optim.AdamW(learning_rate=lr, weight_decay=0.01)
-    warmup = min(50, max(1, steps // 10))
+    warmup = min(200, max(1, steps // 10))
     scheduler = CosineWarmupScheduler(optimizer, lr, warmup, steps)
 
+    # Freeze embed + lm_head during specialist training — vocab is stable
+    # exclude embed/lm_head from trainable parameters
     trainable = {k: v for k, v in backbone.trainable_parameters().items()
-                 if not k.startswith("last_")}
+                 if not any(k.startswith(p) for p in ["last_", "embed", "lm_head"])}
 
     # Hold out 5% for validation
     n_total = len(domain_dataset)
@@ -625,15 +831,89 @@ def train_specialist(backbone, domain_dataset, domain_name,
     val_indices = set(random.sample(range(n_total), n_val))
     train_indices = [i for i in range(n_total) if i not in val_indices]
 
+    # Pre-filter: only keep samples where assistant_id appears within seq_len
+    # (otherwise labels are all -100 and the step wastes compute)
+    valid = []
+    for i in train_indices:
+        _, labels = domain_dataset[i]
+        if any(l != -100 for l in labels[:seq_len]):
+            valid.append(i)
+    dropped = len(train_indices) - len(valid)
+    if dropped:
+        print(f"  Filtered {dropped}/{len(train_indices)} samples (assistant beyond {seq_len=})")
+        train_indices = valid
+    domain_dataset._cache.clear()
+
+    # Tool-call-boundary oversampling: dynamically balance so that
+    # at most ~60% of training indices are early-boundary samples.
+    # Skip entirely if >85% already have tool_call in first 80 chars
+    # (oversampling pure duplicates just causes repetition collapse).
+    early_count = 0
+    for i in range(len(train_indices)):
+        s = domain_dataset.samples[train_indices[i]]
+        assistant = s.get("messages", [{}])[-1].get("content", "")
+        if 0 <= assistant.find("<|tool_call|>") < 80:
+            early_count += 1
+    early_ratio = early_count / len(train_indices) if train_indices else 0
+    if early_ratio > 0.85:
+        print(f"  Oversampling skipped — {early_ratio:.0%} already early-boundary")
+    else:
+        oversampled = []
+        for i in train_indices:
+            sample = domain_dataset.samples[i]
+            assistant = sample.get("messages", [{}])[-1].get("content", "")
+            pos = assistant.find("<|tool_call|>")
+            if 0 <= pos < 80:
+                oversampled.extend([i] * 3)
+            else:
+                oversampled.append(i)
+        n_os = len(oversampled) - len(train_indices)
+        if n_os > 0:
+            print(f"  Oversampled tool-call-boundary samples: +{n_os} ({len(oversampled)} total)")
+            train_indices = oversampled
+
+    # Seq len curriculum: {step_threshold: seq_len}
+    if seq_len_schedule is None:
+        seq_len_schedule = {0: seq_len}
+
     backbone.train()
     step = 0
-    t0 = time.time()
-    t_start = t0
+    t_start = time.time()
     nan_count = 0
     zero_loss_count = 0
+    current_seq_len = 0
+    hw_log_counter = 0
+    tool_call_emit_count = 0
+    tool_call_total_count = 0
 
     while step < steps:
-        loader = make_dataloader(domain_dataset, batch_size=1, max_len=seq_len, indices=train_indices)
+        # Check if seq_len should change
+        new_seq_len = 0
+        for threshold, sl in sorted(seq_len_schedule.items()):
+            if step >= threshold:
+                new_seq_len = sl
+        if new_seq_len != current_seq_len:
+            current_seq_len = new_seq_len
+            print(f"  ── Seq len {current_seq_len} at step {step}")
+            # Re-filter indices for new seq_len (throwaway cache to avoid memory spike)
+            saved_cache = domain_dataset._cache
+            domain_dataset._cache = {}
+            valid = []
+            for i in train_indices:
+                _, labels = domain_dataset[i]
+                if any(l != -100 for l in labels[:current_seq_len]):
+                    valid.append(i)
+            domain_dataset._cache = saved_cache
+            if domain_dataset._cache:
+                domain_dataset._cache.clear()
+            dropped = len(train_indices) - len(valid)
+            if dropped:
+                print(f"  Filtered {dropped}/{len(train_indices)} (assistant beyond seq_len={current_seq_len})")
+                train_indices = valid
+
+        t0 = time.time()
+        log_steps = 0
+        loader = make_dataloader(domain_dataset, batch_size=1, max_len=current_seq_len, indices=train_indices)
         for input_ids, targets in loader:
             if step >= steps:
                 break
@@ -644,13 +924,27 @@ def train_specialist(backbone, domain_dataset, domain_name,
                     backbone.cfg.think_start_id, backbone.cfg.think_end_id
                 )
 
+            tok_local = getattr(domain_dataset, 'tok', None)
+
             def loss_fn(params):
                 backbone.update(params)
-                logits, _ = backbone(input_ids, return_mtp=False)
-                return cross_entropy_loss(logits, targets)
+                logits, _ = backbone(input_ids, return_mtp=False, return_h_states=False)
+                bw = 5.0 if step < 200 else 0.5
+                main = cross_entropy_loss(
+                    logits, targets,
+                    boundary_weight=bw,
+                    boundary_ids={backbone.cfg.tool_call_id, backbone.cfg.observe_id}
+                )
+                if syntax_aux_weight > 0 and tok_local is not None:
+                    main = main + compute_syntax_aux_loss(
+                        targets, tok_local, backbone.cfg, weight=syntax_aux_weight
+                    )
+                return main
 
+            t_fwd = time.time()
             loss, grads = mx.value_and_grad(loss_fn)(trainable)
             mx.eval(loss, grads)
+            t_fwd = time.time() - t_fwd
 
             loss_finite = mx.isfinite(loss).item()
             grads_finite, _ = check_finite(grads)
@@ -662,22 +956,62 @@ def train_specialist(backbone, domain_dataset, domain_name,
 
             if loss.item() == 0.0:
                 zero_loss_count += 1
-                print(f"  ⚠️  [train_specialist] Zero loss at step {step}/{steps} — mask empty. targets unique: {mx.unique(targets).tolist()[:10]}")
+                uniq = sorted(set(targets.flatten().tolist()))[:10]
+                print(f"  ⚠️  [train_specialist] Zero loss at step {step}/{steps} — mask empty. targets unique: {uniq}")
+                step += 1
+                continue
 
+            t_opt = time.time()
             grads, grad_norm = clip_gradients(grads, 1.0)
             optimizer.update(trainable, grads)
             mx.eval(list(trainable.values()), optimizer.state)
             lr_now = scheduler.step()
+            t_opt = time.time() - t_opt
+            log_steps += 1
 
-            if step % 50 == 0 or step == steps - 1:
-                tok_per_sec = (input_ids.shape[1] * 50) / (time.time() - t0 + 1e-8)
+            if log_steps == 100 or step == steps - 1 or step == 0:
+                now = time.time()
+                elapsed = now - t0
+                tok_per_sec = (input_ids.shape[1] * log_steps) / (elapsed + 1e-8)
+
+                # Debug generation trace every 50 steps
+                debug_info = None
+                if tok_local is not None and step > 0:
+                    try:
+                        prompt_ids = [backbone.cfg.bos_id, backbone.cfg.user_id] + \
+                            tok_local.encode("Search arxiv for recent Mamba papers") + \
+                            [backbone.cfg.assistant_id]
+                        debug_info = debug_generation(
+                            backbone, tok_local, backbone.cfg,
+                            prompt_ids_in=prompt_ids, max_new_tokens=80,
+                            repetition_penalty=1.5
+                        )
+                        if debug_info["has_tool_call"]:
+                            tool_call_emit_count += 1
+                        tool_call_total_count += 1
+                    except Exception:
+                        pass
+
+                if debug_info:
+                    print_debug_generation(step, domain_name, debug_info)
+
+                emit_rate = 0.0
+                if tool_call_total_count > 0:
+                    emit_rate = tool_call_emit_count / tool_call_total_count * 100
+
                 print(f"[{domain_name}] step {step:3d}/{steps} "
                       f"loss {loss.item():.4f} lr {lr_now:.2e} "
-                      f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
+                      f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s"
+                      f"  emit={emit_rate:.0f}%")
                 log.step("specialist", step, steps, loss.item(), lr=lr_now,
                          grad_norm=grad_norm, tok_per_s=tok_per_sec,
-                         seq_len=seq_len, domain=domain_name)
-                t0 = time.time()
+                         seq_len=current_seq_len, domain=domain_name)
+                t0 = now
+                log_steps = 0
+                hw_log_counter += 1
+                if hw_log_counter % 2 == 0:
+                    from monitor import print_hw
+                    print_hw(f"spec {domain_name} step {step}")
 
             step += 1
 
@@ -686,7 +1020,7 @@ def train_specialist(backbone, domain_dataset, domain_name,
     backbone.eval()
     val_loader = make_dataloader(domain_dataset, batch_size=1, max_len=seq_len, indices=list(val_indices), shuffle=False)
     for val_ids, val_targets in val_loader:
-        logits, _ = backbone(val_ids, return_mtp=False)
+        logits, _ = backbone(val_ids, return_mtp=False, return_h_states=False)
         vl = cross_entropy_loss(logits, val_targets).item()
         if mx.isfinite(vl) and vl > 0:
             val_losses.append(vl)
@@ -695,10 +1029,39 @@ def train_specialist(backbone, domain_dataset, domain_name,
     elapsed = time.time() - t_start
     val_loss_val = sum(val_losses)/len(val_losses) if val_losses else None
     val_loss_str = f"val_loss={val_loss_val:.4f}" if val_loss_val else "val_loss=N/A"
+
+    # Tool call accuracy eval
+    from eval import evaluate_tool_calls, tool_eval_report, print_tool_report
+    test_prompts = [
+        "<|user|>Search arxiv for Mamba SSM papers<|assistant|>",
+        "<|user|>Get the weather in Tokyo and Pune<|assistant|>",
+        "<|user|>Run the test suite and fix any failures<|assistant|>",
+    ]
+    tok = getattr(domain_dataset, 'tok', None)
+    tool_valid, tool_total, tool_pct = 0, 0, 0.0
+    if tok is not None:
+        try:
+            backbone.eval()
+            call_results = evaluate_tool_calls(backbone, test_prompts, tok, backbone.cfg)
+            tool_report = tool_eval_report(call_results)
+            tool_total = tool_report.get("total", 0)
+            tool_valid = tool_report.get("valid", 0)
+            tool_pct = tool_report.get("valid_pct", 0.0)
+            if tool_total > 0:
+                print_tool_report(tool_report)
+            log.summary("specialist_tool", domain=domain_name, valid=tool_valid,
+                        total=tool_total, valid_pct=tool_pct)
+        except Exception as e:
+            print(f"  ── Tool eval skipped: {e}")
+        finally:
+            backbone.train()
+
     print(f"[train_specialist] '{domain_name}' complete ({step} steps, {elapsed:.0f}s) "
-          f"{val_loss_str} nan={nan_count} zero_loss={zero_loss_count}")
+          f"{val_loss_str} nan={nan_count} zero_loss={zero_loss_count} "
+          f"tool_valid={tool_valid}/{tool_total} ({tool_pct:.1f}%)")
     log.summary("specialist", domain=domain_name, steps=step, elapsed=elapsed,
-                val_loss=val_loss_val, nan_count=nan_count, zero_loss_count=zero_loss_count)
+                val_loss=val_loss_val, nan_count=nan_count, zero_loss_count=zero_loss_count,
+                tool_valid_pct=tool_pct)
 
     # Extract and return only LoRA A/B matrices
     params = dict(tree_flatten(backbone.trainable_parameters()))
@@ -776,6 +1139,8 @@ def distill_backbone(backbone, specialists, combined_data,
     train_samples = tokenized[n_val:]
 
     # ── Distillation loop ──────────────────────────────────
+    # Note: specialist forward passes run on-the-fly per step (~0.3s overhead).
+    # Pre-computing all logits would be 25K × (1,256,32K) × 4B ≈ 800GB — not viable.
     backbone.unfreeze()
     trainable = {k: v for k, v in backbone.trainable_parameters().items()
                  if not k.startswith("last_")}
@@ -786,10 +1151,11 @@ def distill_backbone(backbone, specialists, combined_data,
     t_start = t0
     nan_count = 0
     zero_loss_count = 0
+    hw_log_counter = 0
 
     while step < steps:
         random.shuffle(train_samples)
-        for sample in train_samples:
+        for i, sample in enumerate(train_samples):
             if step >= steps:
                 break
 
@@ -803,7 +1169,7 @@ def distill_backbone(backbone, specialists, combined_data,
                     backbone.cfg.think_start_id, backbone.cfg.think_end_id
                 )
 
-            # Specialist teacher forward (frozen, no grad)
+            # Specialist teacher forward (frozen → constant logits, ~0.3s overhead)
             spec_logits, _ = spec_models[domain](ids)
 
             def loss_fn(params):
@@ -819,8 +1185,10 @@ def distill_backbone(backbone, specialists, combined_data,
                     )
                 return total
 
+            t_fwd = time.time()
             loss, grads = mx.value_and_grad(loss_fn)(trainable)
             mx.eval(loss, grads)
+            t_fwd = time.time() - t_fwd
 
             loss_finite = mx.isfinite(loss).item()
             grads_finite, _ = check_finite(grads)
@@ -832,19 +1200,28 @@ def distill_backbone(backbone, specialists, combined_data,
 
             if loss.item() == 0.0:
                 zero_loss_count += 1
+                step += 1
+                continue
 
+            t_opt = time.time()
             grads, grad_norm = clip_gradients(grads, 1.0)
             optimizer.update(trainable, grads)
             mx.eval(list(trainable.values()), optimizer.state)
+            t_opt = time.time() - t_opt
 
             if step % 10 == 0 or step == steps - 1:
                 elapsed = time.time() - t0
                 print(f"[distill] step {step:3d}/{steps} "
                       f"loss {loss.item():.4f} "
-                      f"grad_norm {grad_norm:.3f} {elapsed:.1f}s")
+                      f"grad_norm {grad_norm:.3f} {elapsed:.1f}s "
+                      f"fwd+bwd={t_fwd:.2f}s opt={t_opt:.2f}s")
                 log.step("distill", step, steps, loss.item(), grad_norm=grad_norm,
                          seq_len=seq_len)
                 t0 = time.time()
+                hw_log_counter += 1
+                if hw_log_counter % 2 == 0:
+                    from monitor import print_hw
+                    print_hw(f"distill step {step}")
 
             step += 1
 

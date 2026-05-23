@@ -35,15 +35,16 @@ class AgentMind(nn.Module):
         # MTP auxiliary head
         self.mtp = MTPHead(cfg, K=4)
 
-    def __call__(self, input_ids, return_mtp=False):
+    def __call__(self, input_ids, return_mtp=False, return_h_states=True):
         # input_ids: [B, L]
         x = self.embed(input_ids)
         h_states = {}
 
         for i, block in enumerate(self.blocks):
             if isinstance(block, MambaBlock):
-                x, h = block(x)
-                h_states[i] = h
+                x, h = block(x, return_state=return_h_states)
+                if return_h_states:
+                    h_states[i] = h
             else:
                 x = block(x)
 

@@ -2,6 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import math
 
+
 @mx.compile
 def _compiled_scan_chunk(dA_c, dBx_c, h):
     C = dA_c.shape[1]
@@ -68,7 +69,6 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(di, d, bias=False)
 
     def _ssm(self, x, h_init=None):
-        # x: [B, L, d_inner]
         B, L, _ = x.shape
 
         if self.debug:
@@ -77,10 +77,9 @@ class MambaBlock(nn.Module):
             assert h_init is None or h_init.shape == (B, self.d_inner, self.d_state), \
                 f"Expected h_init shape {(B, self.d_inner, self.d_state)}, got {h_init.shape}"
 
-        A = -mx.exp(self.A_log)                    # [d_inner, d_state]
+        A = -mx.exp(self.A_log)
 
-        # Project to dt, B_mat, C_mat
-        xbc = self.x_proj(x)                       # [B, L, dt_rank + 2*d_state]
+        xbc = self.x_proj(x)
 
         if self.debug:
             assert xbc.shape[-1] == self.dt_rank + 2 * self.d_state, \
@@ -90,22 +89,15 @@ class MambaBlock(nn.Module):
             xbc, [self.dt_rank, self.dt_rank + self.d_state], axis=-1
         )
 
-        if self.debug:
-            assert dt_raw.shape[-1] == self.dt_rank, f"Expected dt_raw shape to end in {self.dt_rank}, got {dt_raw.shape}"
-            assert B_mat.shape[-1] == self.d_state, f"Expected B_mat shape to end in {self.d_state}, got {B_mat.shape}"
-            assert C_mat.shape[-1] == self.d_state, f"Expected C_mat shape to end in {self.d_state}, got {C_mat.shape}"
+        dt = nn.softplus(self.dt_proj(dt_raw))
 
-        dt = nn.softplus(self.dt_proj(dt_raw))     # [B, L, d_inner]
+        dA = mx.exp(dt[:, :, :, None] * A[None, None])
+        dB = dt[:, :, :, None] * B_mat[:, :, None, :]
+        dBx = dB * x[:, :, :, None]
 
-        # ZOH discretization
-        dA = mx.exp(dt[:, :, :, None] * A[None, None])       # [B, L, d_inner, d_state]
-        dB = dt[:, :, :, None] * B_mat[:, :, None, :]        # [B, L, d_inner, d_state]
-        dBx = dB * x[:, :, :, None]                          # [B, L, d_inner, d_state]
-
-        # Chunked compiled scan — Fast and stable!
-        # Instead of compiling the whole 256-step training step (which crashes Metal compiler),
-        # we only compile a 16-step chunk. This gives a ~7x backward pass speedup 
-        # while keeping the graph size small and memory usage low.
+        # Chunked compiled scan — CHUNK=16 is the confirmed sweet spot on Metal.
+        # Larger chunks create deeper backward graphs that Metal can't fuse.
+        # This holds regardless of d_state size (tested at both 64 and 16).
         CHUNK = 16
         h = h_init if h_init is not None else mx.zeros((B, self.d_inner, self.d_state))
         h_chunks = []
@@ -113,13 +105,12 @@ class MambaBlock(nn.Module):
             t1 = min(t0 + CHUNK, L)
             h_chunk, h = _compiled_scan_chunk(dA[:, t0:t1], dBx[:, t0:t1], h)
             h_chunks.append(h_chunk)
-        h_stack = mx.concatenate(h_chunks, axis=1)           # [B, L, d_inner, d_state]
+        h_stack = mx.concatenate(h_chunks, axis=1)
 
-        # Output: y = sum(h * C) + D * x
         y = mx.sum(h_stack * C_mat[:, :, None, :], axis=-1)
-        return y + x * self.D[None, None, :], h_stack[:, -1]
+        return y + x * self.D[None, None, :], h
 
-    def __call__(self, x, h_state=None):
+    def __call__(self, x, h_state=None, return_state=True):
         # x: [B, L, d_model]
         residual = x
 
@@ -164,21 +155,21 @@ class MambaBlock(nn.Module):
         # Gate
         y_gated = y_ssm * nn.silu(z)
 
-        # Slide conv buffer
         new_conv_state = x_padded[:, x_padded.shape[1] - (self.d_conv - 1):, :]
 
-        new_state = {
-            "ssm_state": h_out,
-            "conv_state": new_conv_state
-        }
+        if return_state:
+            if self.debug:
+                assert h_out.shape == (B, self.d_inner, self.d_state), \
+                    f"Expected output ssm_state shape {(B, self.d_inner, self.d_state)}, got {h_out.shape}"
+                assert new_conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
+                    f"Expected output conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {new_conv_state.shape}"
 
-        if self.debug:
-            assert h_out.shape == (B, self.d_inner, self.d_state), \
-                f"Expected output ssm_state shape {(B, self.d_inner, self.d_state)}, got {h_out.shape}"
-            assert new_conv_state.shape == (B, self.d_conv - 1, self.d_inner), \
-                f"Expected output conv_state shape {(B, self.d_conv - 1, self.d_inner)}, got {new_conv_state.shape}"
-
-        return self.out_proj(y_gated) + residual, new_state
+            return self.out_proj(y_gated) + residual, {
+                "ssm_state": h_out,
+                "conv_state": new_conv_state
+            }
+        else:
+            return self.out_proj(y_gated) + residual, None
 
     # ── Inference-only: single step recurrence ──────────────
     def step(self, x_t, state=None):

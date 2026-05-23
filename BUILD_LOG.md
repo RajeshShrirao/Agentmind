@@ -1107,3 +1107,139 @@ tail -1 logs/training.jsonl | python3 -m json.tool
 grep '"type":"hw"' logs/training.jsonl | python3 -m json.tool
 ```
 
+---
+
+## `[uncommitted]` — 2026-05-23
+
+**Architecture refinement (12 layers, d_state=16) + training infra overhaul + data generation toolkit.**
+
+Multiple convergent changes preparing for the first real multi-round apprenticeship run.
+
+### Architecture: 16 → 12 layers, d_state 64 → 16
+
+After the Round 1 run proved the specialist mechanism works (loss 6.18→1.98), two
+architecture knobs were tightened:
+
+- **n_layers: 16 → 12**: The 4 extra layers accounted for ~25% of backbone params
+  (36.75M out of 147M) but added no measurable accuracy in Round 1. 12 layers with
+  attn_every=3 gives the same 4 attention + 8 Mamba block layout, matching the 3:1
+  hybrid ratio in ~112M params.
+- **d_state: 64 → 16**: The original d_state=64 was inherited from the 600M fantasy.
+  At 147M, d_state=16 matches the Mamba paper's default for this scale. Every SSM
+  block's state tensor goes from (B, 2048, 64) → (B, 2048, 16), reducing SSM
+  intermediates by 4x and improving Metal compiler fusion success rate.
+- **attn_every: 4 → 3**: Maintains the 3:1 Mamba:Attention ratio at 12 layers
+  (8 Mamba + 4 Attention blocks).
+
+Config change: `config.py:8-22`.
+
+### Training infrastructure — debug tooling
+
+Added three new capabilities to `train.py` for protocol-level visibility:
+
+- **`analyze_protocol(text)`**: Scans generated text for `<|tool_call|>` token presence,
+  brace balance, quote balance, `"name"`/`"args"` key presence, and prose word count
+  before the first tool call. Replaces blind loss-watching with structural insight.
+- **`detect_prose_contamination(text)`**: Checks for conversational patterns like "let me",
+  "here are", "sure, "okay" etc. that imply the model is narrating instead of executing.
+- **`debug_generation(...)`**: Runs greedy decode with configurable repetition penalty,
+  returns full protocol/prose analysis. Called automatically every 100 steps during
+  `train_specialist()` — the step log now shows `emit=XX%` (tool call emission rate).
+- **`compute_syntax_aux_loss(targets, tok, cfg, weight)`**: A structural penalty added to
+  the main loss for samples containing `<|tool_call|>`. Penalizes unbalanced braces/quotes
+  and missing `"name"`/`"args"` keys. Weighted at 0.05× main loss.
+
+### Training loop improvements (`train.py`)
+
+- **Seq len curriculum in `train_specialist()`**: Now accepts a `seq_len_schedule` dict
+  (same format as the main `train()`). Re-filters training indices when seq_len changes
+  so samples whose assistant content exceeds the current window are dropped.
+- **Pre-filter samples with no assistant tokens**: Before training, samples where labels
+  are all -100 within the current seq_len are dropped. Saves wasted gradient updates
+  (was ~0.4% in Round 1).
+- **Tool-call-boundary oversampling**: Dynamically balances training indices so early-boundary
+  samples (tool_call within first 80 chars) don't dominate. Skip if >85% already
+  pure early-boundary to avoid repetition collapse.
+- **Freeze embed + lm_head during specialist training**: These layers have no LoRA wrappers
+  and shouldn't be trainable (vocab is stable). Exclusion in `trainable_parameters()` filter.
+- **Boundary weight in CE loss**: `boundary_weight=5.0` for first 200 steps on
+  `{tool_call_id, observe_id}` — extra gradient signal on structural tokens helps the
+  model learn protocol boundaries before the JSON content body.
+- **Post-training tool eval**: After specialist training completes, runs `evaluate_tool_calls`
+  on 3 test prompts and reports `valid/total (XX%)`. Logged to stats logger.
+
+### Distillation changes
+
+- **MTP disabled** (`mtp_weight=0.0` in orchestrator): Round 1 showed MTP causing
+  grad_norm spikes (13→112 at step 20) with no measurable benefit at early stage.
+  Can be re-enabled in later rounds when the backbone has more capacity.
+- **Seq_len capped at 512**: Distillation now uses `min(seq_len, 512)` to avoid
+  RAM thrashing on large domains like research (seq_len=1024).
+- **Timing breakdown**: Per-step log now shows `fwd+bwd=Xs opt=Xs` for performance analysis.
+
+### Agent inference fixes
+
+- **`agent.py`**: Fixed `backbone.update()` to use `tree_unflatten(weights)` —
+  `mx.load('.safetensors')` returns flat dot-separated keys, but `model.update()`
+  expects nested dicts/lists. Without unflattening, `update()` silently skips all
+  keys and leaves the model randomly initialized.
+- **`model/agent_lm.py`**: Added `return_h_states=False` option to `__call__()`.
+  When False, the Mamba blocks skip building the h_states dict entirely,
+  avoiding the memory cost of storing (12 × B × 2048 × 16) hidden tensors.
+- **`model/mamba_block.py`**: Added `return_state=False` option. Saves constructing
+  the `{"ssm_state": ..., "conv_state": ...}` dict on every training forward pass.
+  The state dict is only needed for inference-time `step()` and eval with agent loop.
+
+### Data generation toolkit (new files)
+
+| File | Purpose |
+|------|---------|
+| `generate_llm_synthetic.py` | LLM-driven (Cerebras llama3.1-8b) synthetic data generator. Generates natural multi-turn conversations instead of template-based. 15 samples/batch, 5 reqs/min rate limit. |
+| `generate_tool_caller_data.py` | Targeted tool_caller data via zai-glm-4.7 with batching. 15 samples/req, target 3K samples. |
+| `augment_tool_caller_data.py` | Programmatic seed augmentation: entity swapping, arg re-rolling, adversarial injection (30% rate). 26× multiplier on seed data. |
+| `augmentation/` | Package with 8 augmentation modules (adversarial_mutator, core, dataset_expander, environment_generator, graph_generator, observation_mutator, semantic_mutator, trajectory_mutator) for structured data transformation. |
+| `inspect_protocol_samples.py` | Training data inspector: reports tool call position, prose ratio, whether dataset teaches narration-before-action or immediate protocol execution. Uses `train.py`'s `analyze_protocol`/`detect_prose_contamination`. |
+| `interactive_test.py` | Interactive test harness for trained models. Supports adapter loading, configurable prompts, token limits. |
+| `AGENTS.md` | Project documentation — key commands, architecture, round schedule, critical gotchas. |
+| `docs/synthetic_data_strategy.md` | Synthetic data generation strategy documentation. |
+
+### Config alignment
+
+- `training_orchestrator.py` ROUNDS updated: tool_caller specialist steps 500→2000,
+  distill steps 50→200, added `seq_len_schedule: {0:128, 200:256}`. Planner/recovery/code
+  distill steps 50→150. Recovery latent_stage 4→2 (too aggressive for Round 2).
+- `prepare_data/`: tool_caller domain config now points to prebuilt path
+  (`data/apprentice_tool_caller.jsonl`) and skips HF downloads. Planner and code
+  tightened content-length filters to avoid extreme samples.
+
+### Cleanup
+
+- **14 test_*.py files deleted**: These tested old code paths (16-layer config,
+  d_state=64, sequential scan variants). They would fail against the current architecture
+  and were blocking a clean working tree. Regression coverage moved to documentation
+  and the training loop itself (debug_generation, analyze_protocol, post-training eval).
+- **scratch_dummy.txt / scratch_dummy2.txt** deleted.
+- **`eval.py`**: Added `evaluate_tool_syntax()` — lightweight tool-call syntax metric
+  separate from the full registry validation.
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `config.py` | n_layers 16→12, d_state 64→16, attn_every 4→3 |
+| `train.py` | Seq len curriculum, pre-filtering, oversampling, freeze embed/lm_head, boundary weight, debug generation, syntax aux loss, post-training tool eval, HW logging |
+| `training_orchestrator.py` | Updated ROUNDS configs, router requires ≥3 specialists, distill seq_len cap, MTP disabled |
+| `agent.py` | tree_unflatten for backbone.update() |
+| `model/agent_lm.py` | return_h_states=False option in __call__() |
+| `model/mamba_block.py` | return_state=False option, cleaned debug assertions |
+| `eval.py` | evaluate_tool_syntax() lightweight metric |
+| `prepare_data/` | tool_caller prebuilt path, planner/code tighter filters |
+| (14 test_* files) | Deleted |
+| `AGENTS.md` | **New** |
+| `generate_llm_synthetic.py` | **New** |
+| `generate_tool_caller_data.py` | **New** |
+| `augment_tool_caller_data.py` | **New** |
+| `augmentation/` | **New** |
+| `inspect_protocol_samples.py` | **New** |
+| `interactive_test.py` | **New** |
+| `docs/synthetic_data_strategy.md` | **New** |

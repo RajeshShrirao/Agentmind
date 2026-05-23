@@ -58,6 +58,14 @@ def main(skip_hf=False):
     print(f"{'=' * 60}")
     print_hw(DOMAIN)
 
+    prebuilt = CFG.get("prebuilt_path")
+    if prebuilt and os.path.exists(prebuilt):
+        with open(prebuilt) as f:
+            n = sum(1 for _ in f)
+        if n >= CFG["synthetic_count"] * 0.9:
+            print(f"  [SKIP] Using pre-built {prebuilt} ({n} samples), skipping regeneration")
+            return {DOMAIN: {"all": n, "hf": 0, "synth": n, "adv": 0, "latent": 0}}
+
     all_hf = []
     if skip_hf:
         print("  [HF] Skipping HF downloads (--skip-hf)")

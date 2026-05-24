@@ -144,7 +144,9 @@ def train_specialist(backbone, tokenizer, dataset, domain_name,
         logits = _get_logits(backbone, inp)
         return cross_entropy_loss(logits, tgt)
 
-    loss_fn = mx.compile(loss_fn)
+    grad_fn = mx.compile(mx.value_and_grad(loss_fn))
+    compile_trace_count = 0
+    compile_hit_count = 0
 
     while step < steps:
         target_seq_len = get_seq_len_from_schedule(step, seq_len_schedule)
@@ -159,7 +161,7 @@ def train_specialist(backbone, tokenizer, dataset, domain_name,
             if step >= steps:
                 break
 
-            loss, grads = mx.value_and_grad(loss_fn)(trainable, input_ids, targets)
+            loss, grads = grad_fn(trainable, input_ids, targets)
             mx.eval(loss, grads)
 
             loss_finite = mx.isfinite(loss).item()

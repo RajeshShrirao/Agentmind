@@ -1551,3 +1551,40 @@ The apprenticeship concept is the real innovation — not the custom model archi
 4. **52 hours for 50K pretrain steps** — even with the data fix, full pretraining on 198K samples at seq_len=512 would take ~52 hours on 16GB MBA. Not viable for iteration speed. The pivot removes this entirely.
 
 5. **Don't build what you can download** — Qwen2.5-0.5B has language priors that would take weeks of compute to replicate. The custom model path was building a power plant to charge a phone. The pivot buys us instant grounding at the cost of one `mlx_lm.load()` call.
+
+---
+
+## `[uncommitted]` — 2026-05-24
+
+**mx.compile debunked — throughput is flat at ~580 tok/s. Seq_len is the only lever.**
+
+### What we learned
+
+`mx.compile(mx.value_and_grad(loss_fn))` looked like 10x speedup in isolation but provided virtually NO benefit in the real training loop:
+
+| Seq len | Without compile | With compile | Speedup |
+|---------|----------------|--------------|---------|
+| 128 | 216ms/call | — | ~0% |
+| 256 | 436ms/call | — | ~0% |
+| 384 | 660ms/call | 638ms/call | ~3% |
+| 512 | 873ms/call | — | ~0% |
+
+Throughput is **flat at ~580 tok/s** across all seq lengths. The bottleneck is the backward pass through 500M frozen backbone params — MLX's VJP traces dynamically regardless of `mx.compile`. The compile caches the forward trace but the backward VJP still visits every operation.
+
+### The real optimization: seq_len
+
+Since throughput is tok/s and independent of seq_len, the only lever is reducing tokens processed. Cutting seq_len from 384→128 gives the same throughput but 3x fewer tokens = 3x faster training.
+
+Config change: `tool_caller` seq_len_schedule `{0: 384, 200: 512}` → `{0: 128, 200: 256}`
+
+| Schedule | Training time | Tokens seen |
+|----------|---------------|-------------|
+| `{0:384, 200:512}` | ~3.8h | 2.0M |
+| `{0:128, 200:256}` | ~1.8h | 0.9M |
+
+### Other changes
+
+- **Label fix confirmed**: Step 0 loss 2.47 (vs 0.0000 before) — labels are correctly masking assistant-only
+- **Loss converges**: 2.47 → 0.81 in 100 steps with grad_norm 87→5.4 — healthy training dynamics
+- **docs/optimization_brief.md**: Written with 11 optimization angles for the engineer who can actually fix the backward pass bottleneck. Key candidates: custom LoRALinear VJP (skip backward through 500M frozen params), 4-bit quantization, smaller backbone swap, reduce LoRA targets to q_proj+v_proj only.
+- **AGENTS.md**: Updated hardware notes with real numbers, corrected mx.compile claims, removed misleading 10x speedup claim

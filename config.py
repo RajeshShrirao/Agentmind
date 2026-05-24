@@ -53,7 +53,7 @@ APPRENTICE_ROUNDS = [
         "file": "data/apprentice_tool_caller.jsonl",
         "specialist_steps": 2000,
         "seq_len": 256,
-        "seq_len_schedule": {0: 384, 200: 512},
+        "seq_len_schedule": {0: 128, 200: 256},
         "distill_steps": 200,
         "adversarial": 0.3,
     },

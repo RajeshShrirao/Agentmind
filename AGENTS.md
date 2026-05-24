@@ -41,7 +41,7 @@ Backbone loaded via `mlx_lm.load()`. Special tokens added via `tokenizer._tokeni
 
 | Domain | Spec steps | Seq len | Seq len schedule | Distill steps | Latent stage |
 |---|---|---|---|---|---|---|
-| tool_caller | 2000 | 256 | `{0: 384, 200: 512}` | 200 | 1 |
+| tool_caller | 2000 | 256 | `{0: 128, 200: 256}` | 200 | 1 |
 | planner | 300 | 512 | None | 150 | 2 |
 | recovery | 300 | 256 | `{0: 128, 150: 256}` | 150 | 2 |
 | code | 300 | 512 | None | 150 | 4 |
@@ -83,7 +83,7 @@ These become single tokens at high IDs (>151936). Qwen's native tokens (`<|im_st
 ## Training infrastructure
 
 - **train.py**: `train_specialist()` (API for orchestrator, LoRA only, backbone frozen), `distill_backbone()` (unfreezes backbone, CE + KL)
-- **mx.compile**: Loss function compiled via `mx.compile(loss_fn)` — caches computation graph, reduces step time from ~4s to ~400ms (10x speedup). Compiled function re-traces automatically when input shapes change (seq_len schedule).
+- **mx.compile**: Compiles loss function via `mx.compile(loss_fn)` — marginal benefit (~6%) because MLX's VJP backward pass is still traced dynamically. See `docs/optimization_brief.md` for alternatives.
 - **training_utils.py**: Shared helpers — `GradientAccumulator`, `NaNRecovery`, `BatchLogger`, `compute_loss()`, `format_sample()`
 - **NaN recovery**: All training loops detect non-finite loss/gradients, rollback params + optimizer state, zero gradients, skip batch
 - **CosineWarmupScheduler** (`scheduler.py`): Linear warmup → cosine decay, `min_lr_ratio=0.1`
@@ -141,6 +141,6 @@ mlx, mlx-lm, transformers, sentencepiece, datasets, orjson, msgspec, tqdm, numpy
 - Runs on 16GB MacBook Air. Qwen2.5-0.5B in fp16: ~900MB weights + ~100MB KV cache per 2K tokens.
 - Training peaks at ~3GB RAM (backbone frozen, LoRA only).
 - Swap thrashing observed with seq_len > 1024 or batch_size > 1.
-- Per-step timing: ~1s at seq=128, ~4s at seq=512 (backbone forward + LoRA backward). **With `mx.compile`**: ~200ms at seq=128, ~400ms at seq=256, ~1.6s at seq=512.
-- **Seq=256, grad_accum=8, mx.compile**: ~400ms/step (5000 tok/s throughput). 2000 steps in ~13 min.
+- Per-step timing: ~216ms at seq=128, ~436ms at seq=256, ~660ms at seq=384, ~873ms at seq=512 (backbone forward + LoRA backward). Throughput flat at **~580 tok/s** regardless of seq_len — bottleneck is backward pass through 500M frozen params. `mx.compile` gives only ~6% benefit because VJP backward is dynamically traced.
+- **Seq=128, grad_accum=8**: 1.7s/opt_step, 2000 steps in ~58 min.
 - Timing formula in train.py: `tok/s = seq_len * grad_accum * steps_since_last_log / elapsed` (steps_since matters — at step 0 it's 1, at step 100 it's 100).

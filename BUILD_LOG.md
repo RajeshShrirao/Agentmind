@@ -1243,3 +1243,135 @@ Added three new capabilities to `train.py` for protocol-level visibility:
 | `inspect_protocol_samples.py` | **New** |
 | `interactive_test.py` | **New** |
 | `docs/synthetic_data_strategy.md` | **New** |
+
+---
+
+## `[uncommitted]` — 2026-05-24
+
+**Pivot: abandoning raw pretraining, adopting Qwen2.5-0.5B backbone. Here's why.**
+
+This entry is the pivot diary. I'm documenting the exact chain of evidence that led to abandoning the custom pretrained AgentMind (Mamba+Attention, 147M, random init) in favor of Qwen2.5-0.5B as the backbone. The apprenticeship infrastructure survives; the substrate failure does not.
+
+### Part 1: Architecture upgrades that didn't fix the real problem
+
+Before the pivot was clear, I made architecture changes to fix what I thought was a capacity issue:
+
+| Change | Old | New | Why |
+|--------|-----|-----|-----|
+| `d_state` | 16 | 64 | Mamba-2 default for recall tasks |
+| `attn_window` | 256 | 512 | Double context for longer user queries |
+| `attn_every` | 3 | 2 | 6 Mamba + 6 Attention layers at n_layers=12 |
+| `dt_rank` | auto (ceil(d_model/16)=64) | 64 (explicit) | Matched Mamba-2 recipe |
+| `use_mtp` | False | True | MTP enabled in `config.py` and orchestrator |
+
+MTP was also wired into the standalone `train()` function (activates after step 500) and `distill_backbone()` receives `mtp_weight=0.2`. The orchestrator was passing `mtp_weight=0.0` to distill (disabled after Round 1's grad_norm spike). Fixed to `0.2`.
+
+These changes were individually sensible but collectively irrelevant — the real bottleneck wasn't architecture.
+
+### Part 2: The pretrain run that proved substrate failure
+
+I ran `python pretrain_backbone.py --steps 2000` on the full pretokenized dataset (198K training samples, 10K val).
+
+**What happened:**
+
+```
+Loading pre-tokenized datasets...
+  Train: 198267 samples
+  Val:   10436 samples
+Trainable params: 318,086,144 (318.1M)
+...
+step    0/2000 loss 10.4890 lr 2.00e-04 grad_norm 12.369 601 tok/s
+step   50/2000 loss  6.2156 lr 1.84e-04 grad_norm 11.223 600 tok/s
+...
+step 1900/2000 loss  0.0295 lr 2.10e-05 grad_norm  0.880 538 tok/s
+step 1999/2000 loss  0.0000 lr 2.00e-05 grad_norm  0.330 537 tok/s
+```
+
+Loss went from 10.49 → 0.00. That sounds great. But then I ran generation:
+
+```
+Tokens:  [0, 31988, 31996, 31994, 31992, 31992, 31992, 31992, ...]
+Decoded: ................................................................
+```
+
+The model outputs nothing but `.` (token ID 31247 — the ASCII period). Loss at 0.00 wasn't learning — it was **overfitting to just 2000 samples**.
+
+The arithmetic:
+- 198K training samples × 8 tokens/sample (avg) = ~1.6M tokens per epoch
+- 2000 steps × 8 grad_accum × variable seq_len (128-384) = ~3.5M tokens seen
+- 3.5M / 1.6M = **~2 epochs seen out of 198K unique samples ≈ 1% of data**
+
+The model memorized the first 2000 samples. The `.` output is the mode token of those 2000 — the model collapsed to the most frequent single token.
+
+This wasn't a "slightly undertrained" problem. This was **substrate failure**: the model learned token rituals, not language. The training loop creates a dataloader over the FULL dataset but breaks after N steps — the rest of the data is never sampled. Same bug in `train_specialist()`.
+
+### Part 3: The data epoch fix
+
+I fixed both training loops to sample a random subset of indices per epoch instead of iterating the full dataset:
+
+- **`pretrain_backbone.py`**: 10K indices per epoch (was 198K). 2000 steps → 20% coverage.
+- **`train_specialist()`**: 5K indices per epoch (was 98K+). 2000 steps → 40% coverage.
+
+Each epoch resamples a fresh random subset, so repeated epochs see different data. This is what a normal epoch-based training loop should have been from the start.
+
+But this fix alone doesn't change the underlying truth: at 2000 steps and 198K total samples, even with subset sampling, the model sees only a tiny fraction of data relative to what a 147M model needs (Chinchilla optimal: ~5.5B tokens).
+
+### Part 4: The pivot decision
+
+Even with the data fix, the fundamental question remains: **can a 147M random-init model learn language, tool protocol, planning, recovery, latent reasoning, and routing from ~200K synthetic trajectories?**
+
+The evidence says no. Or at least, not on MBA-scale compute (hours, not weeks).
+
+The `.` output isn't a training bug — it's a signal that the pretraining task (predicting next token on procedural traces) doesn't produce semantic representations at this scale. The model learns formatting, not cognition.
+
+**What survives the pivot:**
+
+| Component | Fate | Why |
+|-----------|------|-----|
+| `training_orchestrator.py` | ~90% unchanged | Round management, adapter lifecycle, distillation loop |
+| `router.py` | ~100% | TaskRouter is backbone-agnostic |
+| `train_specialist()` | ~80% | Same LoRA logic, different model wrapper |
+| `distill_backbone()` | ~80% | Same KL+CE loss, no more MTP |
+| `agent.py` loop | ~70% | KV cache replaces SSM state, tools same |
+| `lora.py` | targets change | Qwen layer names different from AgentMind |
+| `data/pipeline.py` | format_sample changes | Use Qwen's chat template |
+| `eval.py` | forward_with_state → KV cache | Same metrics, different generation |
+
+**What gets deleted:**
+
+- `model/` directory (6 files): Mamba, Attention, MTP, latent, hybrid, agent_lm
+- `pretrain_backbone.py`: no more raw pretraining
+- `init.py`, `export.py`: irrelevant
+- `tokenizer_setup.py`, `agentmind_tok.model`: Qwen's tokenizer replaces custom SentencePiece
+
+**Why Qwen2.5-0.5B:**
+
+| Factor | Value |
+|--------|-------|
+| Size (fp16) | ~900MB weights + ~100MB KV cache per 2K tokens |
+| Language priors | Trained on 18T tokens — solves the "invent language from scratch" problem |
+| mlx-lm integration | Native loading, generation, KV cache |
+| Special tokens | `add_tokens()` preserves our protocol tokens as single IDs |
+| RAM | Fits 16GB MBA with room for training |
+
+The apprenticeship concept is the real innovation — not the custom model architecture. Decoupling cognition orchestration from language modeling lets us build on any backbone.
+
+### Part 5: What was also done (non-pivot changes)
+
+- **`interactive_test.py`**: Fixed to load `.npz` checkpoints and use `_nested_weights` for proper weight mapping.
+- **`export.py`**: Updated HF config template to match current architecture (`attn_window: 512`, `d_state: 64`, 16 layers).
+- **`model/hybrid_block.py`**: Deleted (was empty dead code, never imported).
+- **`AGENTS.md`**: Updated with architecture defaults, MTP details, critical gotchas.
+- **`PIVOT_PLAN.md`**: Created with file-by-file migration plan for Qwen backbone.
+
+### Part 6: Hard lessons
+
+1. **Loss trending down on synthetic data doesn't mean learning** — loss went to 0.00 while the model outputted nothing but `.` The loss metric was measuring fit to memorized formatting, not semantic understanding.
+
+2. **Subset the dataset from day one** — `make_dataloader(full_dataset)` creating an iterator over 198K indices but breaking at step 2000 meant the model never saw 99% of its data. This is a structural bug in the training loop design that should have been caught in code review.
+
+3. **The apprenticeship concept survives any backbone** — LoRA specialists, router dispatch, distillation rounds, adversarial traces — none of these depend on AgentMind architecture. The separation between "cognition infrastructure" and "language substrate" is the real design insight.
+
+4. **52 hours for 50K pretrain steps** — even with the data fix, full pretraining on 198K samples at seq_len=512 would take ~52 hours on 16GB MBA. Not viable for iteration speed. The pivot removes this entirely.
+
+5. **Don't build what you can download** — Qwen2.5-0.5B has language priors that would take weeks of compute to replicate. The custom model path was building a power plant to charge a phone. The pivot buys us instant grounding at the cost of one `mlx_lm.load()` call.

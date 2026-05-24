@@ -14,7 +14,7 @@ HF_CONFIG_TEMPLATE = {
     "expand": 2,
     "dt_rank": 64,
     "n_heads": 8,
-    "attn_window": 256,
+    "attn_window": 512,
     "attn_every": 4,
     "ffn_mult": 8 / 3,
     "max_seq_len": 8192,

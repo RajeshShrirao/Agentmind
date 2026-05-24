@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class AgentMindConfig:
@@ -11,15 +11,15 @@ class AgentMindConfig:
     n_layers: int = 12
 
     # Mamba SSM
-    d_state: int = 16        # memory per channel (16 is enough for procedural continuity)
+    d_state: int = 64        # memory per channel (64 for structured output; Mamba-2 default)
     d_conv: int = 4          # causal conv kernel
     expand: int = 2          # d_inner = expand × d_model = 4096
-    dt_rank: int = -1        # -1 = auto: ceil(d_model / 16) = 64
+    dt_rank: int = 64        # explicit rank; matches Mamba-2 recipe for recall tasks
 
     # Hybrid attention
     n_heads: int = 8
-    attn_window: int = 256   # local attention window
-    attn_every: int = 3      # attention layer every N blocks (8 Mamba + 4 Attn with n_layers=12)
+    attn_window: int = 512   # local attention window (doubled — covers user query at later positions)
+    attn_every: int = 2      # attention layer every N blocks (6 Mamba + 6 Attn with n_layers=12)
 
     # FFN (SwiGLU)
     ffn_mult: float = 8 / 3  # standard SwiGLU multiplier
@@ -99,3 +99,95 @@ class AgentMindConfig:
 
         total = embed + lm_head + n_mamba * mamba_per_layer + n_attn * attn_per_layer + norm
         return total
+
+
+@dataclass
+class TrainingConfig:
+    lr: float = 2e-4
+    weight_decay: float = 0.01
+    warmup_steps: int = 100
+    total_steps: int = 3000
+    grad_clip: float = 1.0
+    batch_size: int = 1
+    grad_accum: int = 8
+    seq_len: int = 512
+    seq_len_schedule: dict = field(default_factory=lambda: {0: 128, 800: 256, 2000: 512})
+    use_mtp: bool = True
+    mtp_weight: float = 0.2
+    mtp_start: int = 500
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+    save_dir: str = "./checkpoints"
+    eval_every: int = 500
+    save_every: int = 200
+
+
+@dataclass
+class SpecialistConfig(TrainingConfig):
+    syntax_aux_weight: float = 0.05
+    boundary_weight: float = 1.5
+    boundary_steps: int = 300
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+
+
+@dataclass
+class DistillConfig(TrainingConfig):
+    beta: float = 0.5
+    lr: float = 1e-5
+    mtp_start: int = 20
+    mtp_weight: float = 0.2
+
+
+APPRENTICE_ROUNDS = [
+    {
+        "domain": "tool_caller",
+        "file": "data/apprentice_tool_caller.jsonl",
+        "specialist_steps": 2000,
+        "seq_len": 256,
+        "seq_len_schedule": {0: 384, 200: 512},
+        "distill_steps": 200,
+        "adversarial": 0.3,
+        "latent_stage": 1,
+    },
+    {
+        "domain": "planner",
+        "file": "data/apprentice_planner.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 512,
+        "seq_len_schedule": None,
+        "distill_steps": 150,
+        "adversarial": 0.3,
+        "latent_stage": 2,
+    },
+    {
+        "domain": "recovery",
+        "file": "data/apprentice_recovery.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 256,
+        "seq_len_schedule": {0: 128, 150: 256},
+        "distill_steps": 150,
+        "adversarial": 0.4,
+        "latent_stage": 2,
+    },
+    {
+        "domain": "code",
+        "file": "data/apprentice_code.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 512,
+        "seq_len_schedule": None,
+        "distill_steps": 150,
+        "adversarial": 0.3,
+        "latent_stage": 4,
+    },
+    {
+        "domain": "research",
+        "file": "data/apprentice_research.jsonl",
+        "specialist_steps": 300,
+        "seq_len": 1024,
+        "seq_len_schedule": None,
+        "distill_steps": 150,
+        "adversarial": 0.3,
+        "latent_stage": 4,
+    },
+]

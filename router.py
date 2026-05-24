@@ -4,6 +4,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 from pathlib import Path
+from training_utils import format_sample
 from stats_logger import GLOBAL as log
 
 
@@ -16,20 +17,6 @@ class TaskRouter(nn.Module):
             nn.Linear(hidden, n_domains),
         )
         self.domain_names = domain_names or []
-
-    @staticmethod
-    def _format_messages(messages):
-        text = ""
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                text += f"<|system|>{content}"
-            elif role == "user":
-                text += f"<|user|>{content}"
-            elif role == "assistant":
-                text += f"<|assistant|>{content}<eos>"
-        return text
 
     def __call__(self, hidden_state):
         if hidden_state.ndim == 3:
@@ -64,7 +51,7 @@ class TaskRouter(nn.Module):
                         "tokenizer required when messages are raw dicts; "
                         "pass a SentencePiece tokenizer with .encode(text, add_bos=True)"
                     )
-                text = self._format_messages(messages)
+                text = format_sample({"messages": messages})
                 token_ids = tokenizer.encode(text, add_bos=True)
             else:
                 token_ids = messages

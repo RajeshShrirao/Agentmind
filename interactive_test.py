@@ -8,12 +8,13 @@ Usage:
 import argparse, time, sys
 from pathlib import Path
 import mlx.core as mx
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten
 
 from config import AgentMindConfig
 from model.agent_lm import AgentMind
 from init import init_agentmind
 from lora import apply_lora, load_adapter, reset_adapter
+from training_utils import _nested_weights
 
 
 def load(checkpoints_dir: str, adapter_name: str = None, bare: bool = False):
@@ -28,32 +29,30 @@ def load(checkpoints_dir: str, adapter_name: str = None, bare: bool = False):
     backbone = AgentMind(cfg)
     backbone = init_agentmind(backbone, cfg)
 
+    # Try safetensors first, then npz
     backbone_path = checkpoints_dir / "backbone.safetensors"
+    if not backbone_path.exists():
+        backbone_path = checkpoints_dir / "backbone.npz"
+    if not backbone_path.exists():
+        backbone_path = checkpoints_dir / "backbone.safetensors" / "weights.safetensors"
+
     if backbone_path.exists():
         weights = mx.load(str(backbone_path))
         # Filter out MTP heads and LoRA A/B
         clean = {k: v for k, v in weights.items()
                  if not k.startswith("mtp.")
-                 and not k.endswith(".A") and not k.endswith(".B")}
+                 and not k.endswith(".A") and not k.endswith(".B")
+                 and k != "last_hidden" and k != "last_mtp_logits"}
 
         if bare:
-            # Load backbone WITHOUT applying LoRA.
-            # Saved backbone has LoRA baked into .base.weight keys.
-            # Strip .base prefix -> .weight so it loads directly.
-            bare_clean = {}
-            for k, v in clean.items():
-                bare_key = k.replace(".base.", ".")
-                bare_clean[bare_key] = v
-            backbone.update(tree_unflatten(list(bare_clean.items())))
-            print(f"Loaded bare backbone from {backbone_path} ({len(bare_clean)} keys)")
+            backbone.update(_nested_weights(clean))
+            print(f"Loaded bare backbone from {backbone_path} ({len(clean)} keys)")
         else:
-            # Apply LoRA first so .base.weight keys match the model
             apply_lora(backbone, rank=16, alpha=32.0)
-            backbone.update(tree_unflatten(list(clean.items())))
+            backbone.update(_nested_weights(clean))
             print(f"Loaded backbone from {backbone_path} ({len(clean)} keys, "
                   f"skipped {len(weights)-len(clean)} MTP/A/B)")
 
-            # Load LoRA adapter on top
             if adapter_name:
                 adapter_path = checkpoints_dir / "adapters" / f"{adapter_name}.safetensors"
                 if adapter_path.exists():

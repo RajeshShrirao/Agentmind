@@ -249,31 +249,38 @@ Goal: a running agent loop with tool protocol.
 2. Rewrite `config.py` — remove AgentMind arch, add `backbone_id`
 3. Create `model_loader.py` — `load_backbone(backbone_id)` → model + tokenizer with special tokens added
 4. Rewrite `lora.py` target list
-5. Rewrite `agent.py` — KV cache generation, no more SSM state
-6. Test: `python agent.py` with a single query
+5. Write `agent.py` — KV cache generation, manual adapter selection (no router yet)
+6. Test: `python agent.py --adapter path` with a single query
 
 **Output**: working agent that can generate tool calls with the pretrained backbone.
 
-## Phase 2: Training (Days 1-2)
+## Phase A: Tool-Caller Specialist (Days 1-2)
 
-Goal: train tool_caller specialist via LoRA.
+Goal: train tool_caller specialist via LoRA. NO distillation, NO router.
 
 1. Rewrite `data/pipeline.py` `format_sample()` — use chat template
 2. Rewrite `train.py` — remove MTP, simplify
-3. Rewrite `training_orchestrator.py` — new model init
-4. Run: `python training_orchestrator.py --rounds 1`
-5. Test: generate with the trained specialist
+3. Rewrite `training_orchestrator.py` — new model init, `--no-distill` default
+4. Run: `python training_orchestrator.py --rounds 1 --no-distill`
+5. Test: `python agent.py --adapter ./checkpoints/adapters/tool_caller.safetensors --query "..."`
 
-**Output**: tool_caller specialist that reliably emits `<|tool_call|>{"name": "...", "args": {...}}`.
+**Output**: tool_caller specialist that reliably emits `<|tool_call|>{"name": "...", "args": {...}}`. Verified manually.
 
-## Phase 3: Full Stack (Days 2-3)
+## Phase B: Adversarial Robustness
 
-Goal: all specialists + router + distillation.
+Goal: tool_caller handles failures (timeouts, malformed responses, retries).
 
-1. Train remaining specialists (planner, recovery, code, research)
+1. Train same tool_caller adapter on failure-heavy augmented data (60% adversarial)
+2. Test with malformed observations, retry patterns, partial results
+
+## Phase C: Full Stack (When ready)
+
+Goal: remaining specialists → router → distillation (only if specialists diverge).
+
+1. Train planner, recovery, code, research specialists (`--no-distill`)
 2. Train router on cached hidden states
-3. Run distillation
-4. Full eval
+3. Run distillation only if specialists are meaningfully different
+4. Full eval with router dispatch
 
 **Output**: full apprenticeship pipeline on pretrained backbone.
 
@@ -290,3 +297,30 @@ Goal: all specialists + router + distillation.
 | Qwen's generation is O(L²) without KV cache | KV cache makes it O(L × d_model × n_layers). For 512-token seq, ~25M FLOPs vs Mamba's ~5M — slower but acceptable |
 | Router needs hidden states, not logits | Use `model.model(input_ids, cache)` to get last hidden before lm_head |
 | `backbone.unfreeze()` in distillation unfreezes 0.5B | Potentially large grads. Use low lr (1e-5) and gradient clipping |
+
+---
+
+## Post-Pivot Review
+
+This pivot is the first time the project feels strategically grounded instead of romantically ambitious. The strongest part: you preserved the cognitive apprenticeship idea while removing the impossible burden of raw intelligence emergence.
+
+**Correct separation of concerns:** Language/world modeling → outsourced to Qwen. Agent cognition orchestration → your focus. That's exactly what small teams should do.
+
+**What gets right:**
+- Removes the "dead substrate" problem — Qwen already has syntax priors, world knowledge, instruction following, reasoning traces
+- Keeps the real innovation: specialists, distillation, router, adversarial traces, apprenticeship accumulation
+- Qwen2.5-0.5B is the correct scale — small enough to iterate fast, strong enough for agent protocols, trainable with LoRA, stable on MLX
+
+**3 traps:**
+1. **Distillation too early** — Don't rush specialist→backbone distillation. You haven't proven specialists work yet. Phase A: Qwen backbone + single tool-caller LoRA only. No router, no distillation.
+2. **Too many specialists** — Start with ONLY `tool_caller`. Tool calling is the foundation. If it fails, planning is useless, recovery impossible, research collapses.
+3. **Router complexity too early** — Manual adapter selection > learned routing until specialists visibly diverge. Easier debugging, clearer evals.
+
+**Recommended build:**
+- Phase A: Qwen 0.5B + single tool-caller LoRA + structured decode + real tool loop
+- Phase B: Adversarial robustness (malformed observations, retries, timeouts, partial failures)
+- Phase C: Planner adapter, router, then distillation
+
+**On the old architecture:** Your earlier Mamba/latent/recurrence obsession was partially a coping mechanism for lack of pretrained intelligence. Archive the Mamba work — it's legitimately valuable and may combine with apprenticeship ideas later — but don't keep it in the critical path.
+
+**Final verdict:** This pivot is correct because you're finally isolating the real variable: cognitive specialization and agent behavior. That's the first version with a plausible path to producing a real agent instead of an endlessly-debugged training artifact.

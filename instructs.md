@@ -1,236 +1,134 @@
 # AgentMind — Cognitive Apprenticeship Build Sequence
-> Build the apprenticeship architecture step by step.
-> Most of the old dense model is already built — this focuses on what's new.
+> Build the apprenticeship architecture step by step on Qwen2.5-0.5B backbone.
+> Old Mamba architecture archived per PIVOT_PLAN — apprenticeship layer is new.
 > 🤖 = Claude Code handles it | 👤 = You do it manually
 >
 > **Convention**: Every prompt ends with a log + commit step.
 > 📝 Update BUILD_LOG.md with a diary entry (challenges, decisions, results).
 > 💾 Commit so every change is tracked in git history.
 
+## Strategic Post-Pivot Analysis
+
+This pivot (custom backbone → 2.5-0.5B) is the first time the project feels strategically grounded instead of romantically ambitious.
+
+**What this pivot gets right:** Removes the "dead substrate" problem — Qwen already has syntax, world knowledge, reasoning traces. Preserves the real innovation (specialists, distillation, router, adversarial traces, apprenticeship). Qwen2.5-0.5B is the correct scale.
+
+**Three traps to avoid:**
+1. **Distillation too early** — Prove specialization first. Phase A: Qwen backbone + single tool-caller LoRA only. No router, no distillation.
+2. **Too many specialists** — Start with ONLY `tool_caller`. Tool calling is the foundation of all agency.
+3. **Router complexity too early** — Manual adapter selection > learned routing until specialists visibly diverge.
+
+**Recommended build order:** Phase A (tool-caller LoRA + tool loop) → Phase B (adversarial robustness) → Phase C (planner, router, distillation).
+
+**Note on data:** You already have 100K+ synthetic data from `generate_scaled_synthetic.py` + `augmentation/` (see `docs/synthetic_data_strategy.md`). The Phase -1 HF dataset section below was written before this pipeline existed — consider it superseded. Skip to training.
+
 ---
 
-## ✅ Already Built (Skip These)
+## ✅ Available Assets
 
-| Component | Status | Verification |
+| Component | Status | Notes |
 |---|---|---|
-| Model architecture (MambaBlock, AttentionBlock, AgentLM) | ✅ Done | 73 tests passing |
-| Config + tokenizer (32K BPE) | ✅ Done | `agentmind_tok.model` exists |
-| Data pipeline (formats, dataset, dataloader) | ✅ Done | Pre-tokenized NPZ files exist |
-| LoRA + init + scheduler | ✅ Done | Verified via smoke tests |
-| Training loop (grad accum, NaN recovery, curriculum) | ✅ Done | `train.py` runs end-to-end |
-| Eval infrastructure (perplexity, tool accuracy, format) | ✅ Done | `eval.py` has all 3 paths |
-| Bug remediation (token IDs, labels, registries) | ✅ Done | 73/73 tests pass |
-| Per-apprentice data generated (v1, template-only) | ✅ Done | 10K samples across 5 domains |
-| Cognitive apprenticeship doc | ✅ Done | `docs/cognitive_apprenticeship.md` |
+| Synthetic data pipeline (3-phase: seeds → augment → 8 expansion layers) | ✅ Done | `generate_scaled_synthetic.py` + `augmentation/` |
+| 100K+ tool_caller dataset, per-domain datasets, router data | ✅ Done | `data/apprentice_*.jsonl`, `data/router_training.jsonl` |
+| Cognitive apprenticeship design doc | ✅ Done | `docs/cognitive_apprenticeship.md` |
+| MLX LoRA utilities (apply_lora, save/load/reset adapter) | ✅ Existing | `lora.py` — update target layer names for Qwen |
+| Training utilities (cross_entropy_loss, clip_gradients, NaN recovery) | ✅ Existing | `training_utils.py` — no arch dependency |
+| Scheduler (CosineWarmupScheduler) | ✅ Existing | `scheduler.py` — no arch dependency |
+| Decode utilities (tool call validation) | ✅ Existing | `decode.py` — text-only, no arch dependency |
+| Old Mamba architecture | 🗄️ Archived | Files deleted per PIVOT_PLAN, not in critical path |
 
 ---
 
-## Phase -1: Per-Expert Data Augmentation
+## Phase -1: Data — Already Complete
 
-> Current 10K/domain is template-only (see `generate_scaled_synthetic.py`).  
-> The model learns formatting, not semantics. We need real tool trajectories.  
-> Use `build_corpus.py` as reference for HF dataset downloading.  
-> ⚠️ No Cerebras/API dependency — that was a bottleneck in the old design.
-
-### 🤖 Prompt 0 — Write prepare_data/ with per-domain HF + synthetic scripts
-```
-Read build_corpus.py (HF dataset downloading pattern) and generate_scaled_synthetic.py (synthetic template pattern).
-
-Create a prepare_data/ directory with one script per apprentice domain.
-Each script must download domain-relevant HuggingFace datasets (streaming),
-convert them to apprentice JSONL format, and fall back to synthetic templates
-when real data is sparse.
-
-Goal: 25K-50K diverse samples per domain (up from 10K template-only).
-
-Directory structure:
-prepare_data/
-├── __init__.py
-├── base.py                  # Shared: HF download, format conversion, train/val split, combine
-├── tool_caller.py           # ToolBench, ToolACE, API-Bank → tool_call patterns
-├── planner.py               # WebArena, AgentInstruct planning → multi-step trajectories
-├── recovery.py              # Synthetic-only (real failure data is rare). Creative failure modes.
-├── code.py                  # The Stack (Python), CodeAlpaca, BigCode → code tool calls
-├── research.py              # FineWeb, UltraChat research → search→fetch→synthesize
-├── run_all.py               # Orchestrates all 5, outputs summary
-└── domain_configs.py        # Per-domain HF dataset list + template config
-
-base.py requirements:
-1. download_hf_dataset(name, split, filter_fn, max_samples) → iterable of dicts
-   - Streaming=True, handle errors gracefully (skip unavailable datasets)
-   - filter_fn: (sample) → bool, applied per-sample
-   - Return generator to avoid OOM
-2. convert_to_apprentice(raw_samples, domain, format_fn) -> list[dict]
-   - format_fn: (raw_sample) → {"messages": [{"role": ..., "content": ...}, ...]}
-   - Must inject domain field for router labels
-3. combine(hf_samples, synthetic_fn, n_synthetic, adversarial_rate) → list[dict]
-   - Merge HF data with synthetic fallback
-   - Apply domain-appropriate adversarial rate
-4. train_val_split(samples, val_frac=0.05) → (train, val)
-5. write_jsonl(samples, path)
-
-Per-domain scripts requirements:
-- Each script:
-  1. Imports from base.py
-  2. Defines domain-specific dataset list (2-3 HF datasets each)
-  3. Defines synthetic fallback_fn (uses generate_scaled_synthetic.py patterns)
-  4. Defines adversarial_rate specific to domain
-  5. Downloads, converts, combines, splits, writes
-  6. Reports dataset composition (% real vs synthetic, adversarial rate)
-
-domain_configs.py: structure
-DOMAIN_CONFIGS = {
-    "tool_caller": {
-        "hf_datasets": [
-            ("ToolBench/ToolBench", "train", lambda x: True, 5000),
-            ("THUDM/AgentInstruct", "train", lambda x: "tool" in str(x).lower(), 3000),
-        ],
-        "synthetic_count": 20000,
-        "adversarial_rate": 0.3,
-    },
-    "planner": {
-        "hf_datasets": [
-            ("osunlp/WebArena", "train", lambda x: len(x.get("action", "")) > 10, 3000),
-            ("THUDM/AgentInstruct", "train", lambda x: "plan" in str(x).lower(), 3000),
-        ],
-        "synthetic_count": 25000,
-        "adversarial_rate": 0.3,
-    },
-    "recovery": {
-        "hf_datasets": [],  # No good HF data for failure recovery
-        "synthetic_count": 30000,
-        "adversarial_rate": 0.4,
-    },
-    "code": {
-        "hf_datasets": [
-            ("bigcode/the-stack", "train", lambda x: x.get("lang") == "python", 10000),
-            ("microsoft/CodeAlpaca", "train", None, 5000),
-        ],
-        "synthetic_count": 15000,
-        "adversarial_rate": 0.3,
-    },
-    "research": {
-        "hf_datasets": [
-            ("HuggingFaceFW/fineweb", "train", lambda x: len(x.get("text", "")) > 200, 10000),
-            ("HuggingFaceH4/ultrachat_200k", "train_sft", None, 5000),
-        ],
-        "synthetic_count": 20000,
-        "adversarial_rate": 0.3,
-    },
-}
-
-Key design rules:
-- NO Cerebras/OpenAI/API dependency — synthetic uses templates only
-- HF datasets must use streaming=True to avoid disk blowup
-- Each script must handle dataset download failures gracefully (skip, don't crash)
-- Output to data/apprentice_{domain}.jsonl (overwrite old template-only versions)
-- Also generate data/router_training.jsonl (sample 200 per domain, shuffled)
-- Report: total samples, % real vs synthetic, adversarial count, latent count
-
-Smoke test:
-python prepare_data/run_all.py
-Expected output:
-  [tool_caller] 35000 samples (HF: 8000, synth: 27000, adversarial: 10500)
-  [planner]     ...
-  [recovery]    ...
-  [code]        ...
-  [research]    ...
-  [router]      1000 samples (200 per domain)
-```
-
-After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: what HF datasets mapped to which domains, yield rates from HF, challenges with format conversion, any datasets that were unavailable
-- 💾 **Commit** with message: `prepare_data/ — per-domain HF + synthetic data pipeline (25-50K/domain, no API dependency)`
+> You already have 100K+ synthetic data from `generate_scaled_synthetic.py` + `augmentation/`. See `docs/synthetic_data_strategy.md` for quality metrics (103K samples, 0 validation errors, 14/14 tools, 46% adversarial). No HF dataset downloading needed. Skip directly to Phase A.
 
 ### 🤖 Prompt 1 — Write apprentice.py
 ```
 Read docs/cognitive_apprenticeship.md (it's in the repo).
-Implement apprentice.py — the CognitiveApprentice wrapper.
+Read the existing lora.py (LoRALinear, apply_lora).
+Read the existing training_utils.py (cross_entropy_loss, GradientAccumulator).
+
+Implement apprentice.py — the CognitiveApprentice wrapper for Qwen2.5-0.5B.
+
+The backbone is loaded via mlx_lm.load(), NOT a custom model class.
+Qwen2.5-0.5B has d_model=512, 24 layers, 151K vocab. LoRA rank=16 gives ~6M trainable params.
 
 It must:
-1. Wrap a backbone (AgentMind-147M) with a LoRA adapter
-2. Support save_adapter() / load_adapter() to serialize just the 2.36M LoRA weights
-3. Support reset_adapter() to zero out the LoRA weights (fresh start for each apprentice)
-4. Provide train_on_domain(dataset, steps, lr) — trains only the LoRA adapter on domain data
-5. Provide distill_into_backbone(backbone, specialist_data, beta=0.5, mtp_weight=0.2) — 
-   unfreezes backbone, runs task_loss + KL(backbone || specialist) + MTP aux loss
-
-The key constraint: each apprentice adapter is 2.36M params (rank=16, alpha=32).
-Adapters should be savable as standalone .safetensors files.
+1. Wrap a Qwen backbone (from mlx_lm.load()) with LoRA adapters on Qwen's target modules:
+   ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+2. Support save_adapter() / load_adapter() to serialize just the LoRA weights (~9MB as .safetensors)
+3. Support reset_adapter() to zero out LoRA weights (fresh start for each specialist)
+4. Provide train_on_domain(dataset, steps, lr) — trains ONLY LoRA, backbone frozen
+5. No MTP, no latent modules — those do not exist in this architecture
 
 Implementation plan:
 class CognitiveApprentice:
-    def __init__(self, backbone, adapter_name, rank=16, alpha=32.0):
-        # Clone backbone structure, apply LoRA, freeze backbone weights
-        # Store adapter_name, rank, alpha
+    def __init__(self, backbone, tokenizer, adapter_name, rank=16, alpha=32.0):
+        # backbone is already loaded via mlx_lm.load()
+        # apply_lora(backbone, rank=16, alpha=32.0, targets=[q_proj, k_proj, ...])
+        # Freeze backbone weights, only LoRA A/B trainable
     
     def save_adapter(self, path):
-        # Save only LoRA A/B matrices + metadata (name, rank, alpha, targets)
+        # Save LoRA A/B matrices via mlx.save_safetensors()
+        # Include metadata: backbone_id, lora_rank, lora_alpha, target_modules
     
     def load_adapter(self, backbone, path):
-        # Load LoRA weights and apply to a fresh backbone
+        # Load LoRA weights from .safetensors, apply to backbone
     
     def reset_adapter(self):
         # Re-init A (random normal / sqrt(rank)) and B (zeros)
-    
-    def train_step(self, batch):
-        # Single training step on the LoRA adapter (backbone frozen)
-        # Returns loss
+        # Keep backbone weights untouched
     
     def train(self, dataset, steps=500, lr=2e-4, seq_len=256):
-        # Training loop: create dataloader, optimizer, scheduler
-        # Uses existing train infrastructure (cross_entropy_loss, clip_gradients)
-        # Returns trained adapter weights
-    
-    def distill(self, backbone, specialists, data, beta=0.5, mtp_weight=0.2, steps=50):
-        # Unfreeze backbone
-        # For each batch:
-        #   b_logits, _ = backbone(batch.ids, return_mtp=True)  # MTP active
-        #   s_logits = {name: specialist(batch.ids) for name, specialist in specialists}
-        #   correct = batch.domain
-        #   loss = CE(b_logits, batch.labels) + beta * KL(b_logits, s_logits[correct])
-        #          + mtp_weight * MTP_loss(backbone.last_mtp_logits, batch.labels)
-        #   grad(loss).update(backbone.params)
-        # Freeze backbone
+        # Training loop using mlx.optimizers.AdamW
+        # Use existing cross_entropy_loss from training_utils.py
+        # logits, _ = backbone(input_ids)  # standard mlx_lm forward
+        # loss = cross_entropy_loss(logits, labels, ignore_index=-100)
+        # Returns trained adapter weights dict
 
-Smoke test after writing:
+Smoke test:
 python -c "
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
+from mlx_lm import load as load_model
 from apprentice import CognitiveApprentice
-cfg = AgentMindConfig()
-backbone = AgentMind(cfg)
-app = CognitiveApprentice(backbone, 'tool_caller')
+model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+app = CognitiveApprentice(model, tokenizer, 'tool_caller')
 print('Apprentice created. Adapter name:', app.adapter_name)
-print('Trainable params:', sum(p.size for _, p in backbone.trainable_parameters()))
+print('Trainable params:', sum(p.size for _, p in model.trainable_parameters()))
 "
-Expected: ~2.36M trainable params.
+Expected: ~6M trainable params.
 ```
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: what CognitiveApprentice wraps, why save/load/reset/distill matter, the 2.36M constraint, any MLX surprises
-- 💾 **Commit** with message: `apprentice.py — CognitiveApprentice wrapper (LoRA save/load/reset + distill)`
+- 📝 **Update BUILD_LOG.md** — diary entry: Qwen LoRA wrapper, ~6M params, save/load/reset lifecycle, no MTP
+- 💾 **Commit** with message: `apprentice.py — CognitiveApprentice for Qwen2.5-0.5B (LoRA save/load/reset)`
 
 ---
 
-### 🤖 Prompt 2 — Write router.py
+### 🤖 Prompt 2 — Write router.py (used in Phase C only)
 ```
 Read docs/cognitive_apprenticeship.md (it's in the repo).
+Read PIVOT_PLAN.md section "7. router.py — Use backbone's last hidden state".
+
 Implement router.py — the TaskRouter for apprentice dispatch.
 
+Key architectural note: The backbone is Qwen2.5-0.5B (d_model=512) loaded via
+mlx_lm.load(). Hidden states come from model.model (the inner transformer),
+not from a custom forward_with_state().
+
 It must:
-1. TaskRouter: a tiny classifier (d_model=1024 → 64 → n_domains = 5)
-   - Takes backbone last_hidden state (pooled or [CLS]-like)
-   - Outputs logits over domain names
-   - ~65K params total
+1. TaskRouter: a tiny classifier (d_model=512 → 64 → n_domains = 5)
+   - Takes last-position hidden state from Qwen's inner transformer
+   - Outputs logits over domain names (~33K params)
 2. select_expert(hidden_state, threshold=0.6) -> domain_name
    - If max softmax < threshold, return "tool_caller" (fallback)
-3. train(router_dataset, backbone, steps=200) -> trained router
-   - For each sample: backbone forward, extract last_hidden, train router to predict domain
+3. train(router_dataset, backbone, tokenizer, steps=200) -> trained router
+   - For each sample: tokenize, forward through model.model (inner transformer),
+     extract last hidden position, train router classifier
 
 Implementation plan:
 class TaskRouter(nn.Module):
-    def __init__(self, d_model=1024, hidden=64, n_domains=5, domain_names=None):
+    def __init__(self, d_model=512, hidden=64, n_domains=5, domain_names=None):
         self.classifier = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.ReLU(),
@@ -239,158 +137,149 @@ class TaskRouter(nn.Module):
         self.domain_names = domain_names or []
     
     def __call__(self, hidden_state):
-        # hidden_state: [B, L, d_model] — use LAST position, not mean-pool.
-        # Design doc (Inference Flow section) and agent.py both extract the last
-        # hidden position for routing: backbone.last_hidden[:, -1, :]. Using mean
-        # would create a train/infer mismatch — router trained on mean but queried
-        # at inference with the last token. Always use last position.
+        # hidden_state: [B, L, d_model] — use LAST position
         if hidden_state.ndim == 3:
             last = hidden_state[:, -1, :]  # [B, d_model]
         else:
-            last = hidden_state             # already [B, d_model]
+            last = hidden_state
         return self.classifier(last)  # [B, n_domains]
     
     def select_expert(self, hidden_state, threshold=0.6):
-        # Pass the full hidden_state tensor — __call__ extracts the last position.
         logits = self(hidden_state)
         probs = mx.softmax(logits, axis=-1)
         if mx.max(probs).item() < threshold:
-            return "tool_caller"  # fallback
+            return "tool_caller"
         return self.domain_names[mx.argmax(logits, axis=-1).item()]
 
-    def train(self, dataset, backbone, tokenizer=None, steps=200, lr=1e-3):
-        # dataset: list of {"domain": str, "messages": [...]}
+    def train(self, dataset, backbone, tokenizer, steps=200, lr=1e-3):
         # For each sample:
-        #   1. Tokenize messages
-        #   2. backbone.forward_with_state(ids, {}) → backbone.last_hidden
-        #      Note: backbone.last_hidden is [B, L, d_model]. Pass the full tensor;
-        #      __call__ will extract the last position.
-        #   3. router(backbone.last_hidden) → domain_logits
-        #   4. CE(domain_logits, domain_label)
-        #   5. grad update router only (backbone frozen)
+        #   1. Tokenize messages via tokenizer
+        #   2. Forward through model.model (inner transformer, no lm_head)
+        #      last_hidden = model.model(input_ids)[:, -1, :]
+        #   3. router(last_hidden) → domain_logits
+        #   4. CE(domain_logits, domain_label), grad update router only
 
 Smoke test:
 python -c "
 from router import TaskRouter
 import mlx.core as mx
-router = TaskRouter(d_model=1024, n_domains=5, domain_names=['tool_caller','planner','recovery','code','research'])
-hidden = mx.ones((1, 16, 1024))  # [B=1, L=16, d_model=1024]
-logits = router(hidden)           # internally uses hidden[:, -1, :]
-print('Router output shape:', logits.shape)  # expected: (1, 5)
+router = TaskRouter(d_model=512, n_domains=5,
+    domain_names=['tool_caller','planner','recovery','code','research'])
+hidden = mx.ones((1, 16, 512))
+logits = router(hidden)
+print('Router output shape:', logits.shape)  # (1, 5)
 expert = router.select_expert(hidden)
 print('Selected expert:', expert)
-print('Router params: ~65K (verify: sum of param sizes)')
 "
 
-# Verify last-position extraction is consistent:
-# - router.__call__: uses hidden[:, -1, :]
-# - agent.py _select_specialist: self.router(hidden_state[:, -1:, :]) — passes [B,1,D]
-#   both collapse to the same last token representation. No pooling mismatch.
-
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: why last-position (not mean-pool) for routing, train/infer parity, 65K classifier, fallback threshold rationale
-- 💾 **Commit** with message: `router.py — TaskRouter for apprentice dispatch (last-position hidden, 65K params, threshold-based fallback)`
+- 📝 **Update BUILD_LOG.md** — diary entry: d_model=512 for Qwen, hidden from model.model (not forward_with_state), ~33K params
+- 💾 **Commit** with message: `router.py — TaskRouter for Qwen (last-position hidden, d_model=512, Phase C)`
 ```
 
 ---
 
-### 🤖 Prompt 3 — Update lora.py with adapter save/load/reset
+### 🤖 Prompt 3 — Update lora.py with Qwen target layers + adapter save/load/reset
 ```
 Read the existing lora.py.
-Add three methods to the LoRALinear class or as standalone functions:
+Read PIVOT_PLAN.md section "2. lora.py — Target Qwen layer names instead of AgentMind".
 
-1. save_adapter(adapter_name, rank, alpha, target_modules, save_dir) 
-   - Iterates model.trainable_parameters()
-   - Filters to LoRA A/B weights
-   - Saves as MLX .safetensors with metadata keys: lora_rank, lora_alpha, target_modules
+Update target_modules default from old AgentMind layers to Qwen2.5 layers:
+OLD: ["in_proj", "out_proj", "o_proj", "q_proj", "v_proj", "lm_head"]
+NEW: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+These are the standard SwiGLU transformer Linear layers in Qwen2.5.
+The LoRALinear class itself doesn't change — just the target names in apply_lora().
+
+Add three methods (as standalone functions using mlx):
+
+1. save_adapter(model, adapter_name, save_dir, rank=16, alpha=32.0, target_modules=None)
+   - Iterates model.trainable_parameters(), filters to LoRA A/B weights
+   - Saves as MLX .safetensors with metadata keys
 
 2. load_adapter(model, adapter_path)
    - Loads LoRA weights from .safetensors
-   - Applies them to a fresh backbone (model must have same architecture)
-   - Returns model with loaded adapters
+   - Applies to a Qwen backbone (same architecture assumed)
 
 3. reset_adapter(model)
-   - Re-initializes all LoRA A matrices (random normal / sqrt(rank))
-   - Re-initializes all LoRA B matrices (zeros)
+   - Re-init LoRA A (random normal / sqrt(rank)) and B (zeros)
    - Does NOT touch backbone weights
-
-These are needed during the apprenticeship loop:
-- save after training each specialist
-- load when running agent inference (swap adapters)
-- reset between specialists to avoid cross-contamination
 
 Test after writing:
 python -c "
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
+from mlx_lm import load as load_model
 from lora import apply_lora, save_adapter, load_adapter, reset_adapter
 import tempfile, os
 
-cfg = AgentMindConfig()
-model = AgentMind(cfg)
-model = apply_lora(model, rank=16, alpha=32.0)
+model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+model = apply_lora(model, rank=16, alpha=32.0,
+    targets=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'])
 
-# Save adapter
 tmpdir = tempfile.mkdtemp()
 save_adapter(model, 'tool_caller', tmpdir)
 assert os.path.exists(f'{tmpdir}/tool_caller.safetensors')
 print('Save OK')
 
-# Reset and verify
 reset_adapter(model)
 print('Reset OK')
 
-# Reload
-model2 = AgentMind(cfg)
-model2 = apply_lora(model2, rank=16, alpha=32.0)
+model2, _ = load_model('Qwen/Qwen2.5-0.5B')
+model2 = apply_lora(model2, rank=16, alpha=32.0,
+    targets=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'])
 load_adapter(model2, f'{tmpdir}/tool_caller.safetensors')
 print('Load OK')
 "
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: adapter save/load/reset lifecycle, .safetensors format, why reset is needed between specialists
-- 💾 **Commit** with message: `lora.py — adapter save/load/reset for apprenticeship lifecycle`
+- 📝 **Update BUILD_LOG.md** — diary entry: Qwen target modules, adapter lifecycle, .safetensors format
+- 💾 **Commit** with message: `lora.py — Qwen target layers + adapter save/load/reset`
 ```
 
 ---
 
-### 🤖 Prompt 4 — Add load_lora() to model/agent_lm.py
+### 🤖 Prompt 4 — Add load_lora() to lora.py (replaces old model/agent_lm.py)
 ```
-Read model/agent_lm.py. Add a load_lora() method to the AgentMind class.
+NOTE: model/agent_lm.py is DELETED per PIVOT_PLAN. There is no AgentMind class anymore.
+The load_lora functionality should be added to lora.py as a standalone function.
 
-This method is needed at inference time to dynamically swap adapter weights
-(2.36M params) on the frozen backbone. It must be fast (<1ms for the swap).
+Read lora.py. Add a load_lora() function that works with any MLX model that has
+LoRALinear layers applied.
 
-def load_lora(self, adapter_weights: dict):
+This is needed at inference time to dynamically swap adapter weights (~9MB)
+on the frozen Qwen backbone. Must be fast (<1ms on Apple Unified Memory).
+
+def load_lora(model, adapter_weights: dict):
     '''
-    Load LoRA A/B weights from a specialist adapter into the model.
-    adapter_weights: dict of {"layer_name.A": mx.array, "layer_name.B": mx.array, ...}
+    Load LoRA A/B weights into an MLX model with LoRALinear layers.
+    adapter_weights: dict of {"layer_name.A": mx.array, "layer_name.B": ...}
     
-    The model already has LoRALinear layers applied from lora.py.
-    This just updates the A and B matrices of existing LoRALinear layers.
+    The model already has LoRALinear layers applied from apply_lora().
+    This just updates A and B matrices of existing LoRALinear layers.
+    Works with Qwen2.5 or any MLX model using the same target module names.
     '''
     for name, param in adapter_weights.items():
-        # Walk the module tree and set the matching parameter
-        # e.g., "blocks.0.in_proj.A" -> self.blocks[0].in_proj.A = param
+        # Walk model module tree via dotted path
+        # e.g., "model.layers.0.self_attn.q_proj.lora_a" -> find by name
         ...
 
 Test:
 python -c "
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
-from lora import apply_lora
-cfg = AgentMindConfig()
-model = AgentMind(cfg)
-model = apply_lora(model)
+from mlx_lm import load as load_model
+from lora import apply_lora, load_lora
+import mlx.core as mx
+
+model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+model = apply_lora(model, targets=['q_proj', 'k_proj', 'v_proj', 'o_proj',
+    'gate_proj', 'up_proj', 'down_proj'])
 
 # Get current adapter weights
-adapter_weights = {k: v for k, v in model.trainable_parameters().items() 
-                   if not k.startswith('last_')}
+adapter_weights = {k: v for k, v in model.trainable_parameters().items()}
 
 # Create new model and load
-model2 = AgentMind(cfg)
-model2 = apply_lora(model2)
-model2.load_lora(adapter_weights)
+model2, _ = load_model('Qwen/Qwen2.5-0.5B')
+model2 = apply_lora(model2, targets=['q_proj', 'k_proj', 'v_proj', 'o_proj',
+    'gate_proj', 'up_proj', 'down_proj'])
+load_lora(model2, adapter_weights)
 
 # Verify weights match
 for k in adapter_weights:
@@ -401,409 +290,351 @@ print('load_lora verified: all weights match')
 "
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: load_lora for fast adapter swapping (<1ms), module tree walking approach, why it's separate from save/load in lora.py
-- 💾 **Commit** with message: `agent_lm.py — load_lora() for sub-millisecond adapter swap`
+- 📝 **Update BUILD_LOG.md** — diary entry: load_lora as standalone function, works with any MLX LoRA model, sub-ms swap
+- 💾 **Commit** with message: `lora.py — load_lora() for fast adapter swapping on Qwen`
 ```
 
 ---
 
-### 🤖 Prompt 5 — Refactor train.py into reusable functions
+### 🤖 Prompt 5 — Refactor train.py into reusable functions (Qwen architecture)
 ```
 Read the existing train.py. It currently has a monolithic train() function.
-Refactor it into two callable entry points for the training_orchestrator:
+Read PIVOT_PLAN.md section "4. train.py — Remove MTP, simplify model creation".
+Read training_utils.py (cross_entropy_loss, clip_gradients, etc.).
 
-1. train_specialist(backbone, domain_dataset, domain_name, steps=500, lr=2e-4, seq_len=256, latent_stage=1) -> adapter_weights
-   - Wraps backbone in CognitiveApprentice for the given domain
-   - Trains ONLY the LoRA adapter (backbone stays FROZEN throughout)
-   - Returns the trained adapter weights (LoRA A/B matrices)
-   - Uses existing: cross_entropy_loss, clip_gradients, CosineWarmupScheduler
-   - Per-step: latent stage injection via inject_latent_tokens + latent_loss_mask
+Refactor into two callable entry points. IMPORTANT: model/agent_lm.py,
+model/latent.py, model/mtp_head.py, init.py are ALL DELETED. The backbone
+is loaded via mlx_lm.load(), not constructed from config.
 
-   ⚠️ MTP DISABLED during specialist training:
-   Specialist adapters are 2.36M params — the backbone MTP head (4 × 32K vocab) is larger
-   than the adapter. More importantly, MTP runs on the backbone, which is FROZEN here.
-   Never set return_mtp=True inside train_specialist. Add an explicit assertion:
-       assert not return_mtp_in_specialist, "MTP must not run during specialist training — backbone is frozen"
-   MTP only fires during distill_backbone() when the backbone is unfrozen.
-   Add a clear comment to this effect in the code.
+1. train_specialist(backbone, tokenizer, domain_dataset, domain_name,
+                    steps=500, lr=2e-4, seq_len=256) -> adapter_weights
+   - backbone is loaded via mlx_lm.load(), already has LoRA applied
+   - Trains ONLY LoRA adapter (backbone stays FROZEN)
+   - Uses mlx.optimizers.AdamW, CosineWarmupScheduler, cross_entropy_loss
+   - No MTP (modules don't exist), no latent stage injection (modules don't exist)
+   - Tokenization uses tokenizer.apply_chat_template() with assistant mask
 
-   Latent stage is passed in from the orchestrator (not derived from step count).
-   The orchestrator maps per-round stages explicitly (see training_orchestrator.py).
-
-2. distill_backbone(backbone, specialists, combined_data, beta=0.5, mtp_weight=0.2, steps=50) -> None
+2. distill_backbone(backbone, specialists, combined_data, beta=0.5, steps=50) -> None
    - Unfreezes backbone
-   - For each batch: 
-     - backbone forward with return_mtp=True  ← MTP ENABLED here (backbone unfrozen)
-     - specialist forward for correct domain (backbone frozen for each specialist forward)
-     - loss = CE(backbone, labels) + beta * KL(backbone || specialist) + mtp_weight * MTP_loss
-       MTP starts after step 20 for stability (warm-up before applying MTP auxiliary loss)
-   - Gradient clipping, NaN recovery (same as existing)
-   - Freezes backbone after distillation
-   - Uses existing: cross_entropy_loss, mtp_loss, clip_gradients, check_finite
+   - loss = CE(backbone, labels) + beta * KL(backbone, specialist_model)
+   - No MTP loss (mtp_head.py doesn't exist)
+   - Gradient clipping, NaN recovery, freeze backbone after
 
-Keep the existing monolith train() function as-is for backward compatibility,
-but add the two new functions alongside it. Import what's needed:
+Keep the old train() for backward compat but add the two new functions:
 
-from model.latent import get_latent_stage, inject_latent_tokens, latent_loss_mask
-from model.mtp_head import mtp_loss
+# Training utils already exist — use them:
+from training_utils import cross_entropy_loss, clip_gradients, check_finite
+from scheduler import CosineWarmupScheduler
 
-Test both functions with a 5-step smoke test:
+Test:
 python -c "
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
+from mlx_lm import load as load_model
 from lora import apply_lora
-from init import init_agentmind
-from train import train_specialist, distill_backbone, cross_entropy_loss
-import mlx.core as mx
+from train import train_specialist, distill_backbone
+from data.pipeline import AgentDataset
 
-cfg = AgentMindConfig()
-backbone = AgentMind(cfg)
-backbone = init_agentmind(backbone, cfg)
+model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+model = apply_lora(model, targets=['q_proj','k_proj','v_proj','o_proj',
+    'gate_proj','up_proj','down_proj'])
 
-# Test train_specialist with fake data
 fake_data = [{'domain': 'tool_caller', 'messages': [
     {'role': 'user', 'content': 'test'},
     {'role': 'assistant', 'content': '<|tool_call|>{\"name\": \"search\"}<|observe|>{\"ok\": true}\nDone.'}
 ]}]
-from data.pipeline import AgentDataset
-import sentencepiece as spm
-tok = spm.SentencePieceProcessor()
-tok.load('agentmind_tok.model')
-ds = AgentDataset.__new__(AgentDataset)
-ds.samples = fake_data
-ds.tok = tok
-ds.cfg = cfg
+ds = AgentDataset(fake_data, tokenizer=tokenizer)
 
-weights = train_specialist(backbone, ds, 'tool_caller', steps=2)
+weights = train_specialist(model, tokenizer, ds, 'tool_caller', steps=2)
 print('train_specialist OK, got', len(weights), 'weight tensors')
-
-# Test distill_backbone
-specialists = {'tool_caller': weights}
-distill_backbone(backbone, specialists, ds, steps=2)
-print('distill_backbone OK')
 "
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: refactoring train.py into train_specialist + distill_backbone, why monolithic function needed splitting, how latent injection + MTP were wired
-- 💾 **Commit** with message: `train.py — refactored into train_specialist() + distill_backbone() for apprenticeship`
+- 📝 **Update BUILD_LOG.md** — diary entry: Qwen-based training, no MTP/latent, mlx_lm.load() model creation
+- 💾 **Commit** with message: `train.py — refactored for Qwen (no MTP, no latent, mlx_lm.load())`
 ```
 
 ---
 
-### 🤖 Prompt 6 — Write training_orchestrator.py
+### 🤖 Prompt 6 — Write training_orchestrator.py (Qwen architecture)
 ```
 Read docs/cognitive_apprenticeship.md (it's in the repo).
-Read the updated train.py (has train_specialist and distill_backbone).
-Read data/pipeline.py (AgentDataset, make_dataloader).
+Read PIVOT_PLAN.md section "5. training_orchestrator.py".
+Read train.py (train_specialist, distill_backbone).
+Read data/pipeline.py (AgentDataset).
 
 Implement training_orchestrator.py — the round management loop.
 
-It must run the full apprenticeship protocol:
-
-# Per-round latent stage mapping — explicit, from the design doc table:
-#   Round 1 (tool_caller):         latent stages 1→2 (basic tool calling, then wrap scratch in boundaries)
-#   Round 2 (planner):             latent stages 2→3 (planned trajectories, 50% CoT → latent replacement)
-#   Round 3+ (recovery/code/research): latent stage 4 (full latent — CoT removed, only think boundaries)
-# This mapping MUST be explicit in the orchestrator — do NOT derive it from global step count.
-# Pass latent_stage directly to train_specialist() for each round.
+KEY DIFFERENCES FROM OLD ARCHITECTURE:
+- Backbone is loaded via mlx_lm.load('Qwen/Qwen2.5-0.5B'), NOT AgentMind()
+- No init_agentmind(), no AgentMindConfig — those files are deleted
+- No latent_stage in round config — model/latent.py is deleted
+- Distillation is opt-in (--distill-only flag), default is no distillation
 
 ROUNDS = [
-    {
-        "domain": "tool_caller",
-        "file": "data/apprentice_tool_caller.jsonl",
-        "specialist_steps": 500,
-        "seq_len": 256,
-        "distill_steps": 50,
-        "adversarial": 0.3,
-        "latent_stage": 1,  # Round 1: start at stage 1, curriculum advances to 2
-    },
-    {
-        "domain": "planner",
-        "file": "data/apprentice_planner.jsonl",
-        "specialist_steps": 300,
-        "seq_len": 512,
-        "distill_steps": 50,
-        "adversarial": 0.3,
-        "latent_stage": 2,  # Round 2: start at stage 2, advances to 3
-    },
-    {
-        "domain": "recovery",
-        "file": "data/apprentice_recovery.jsonl",
-        "specialist_steps": 300,
-        "seq_len": 256,
-        "distill_steps": 50,
-        "adversarial": 0.4,
-        "latent_stage": 4,  # Round 3+: full latent — backbone already understands silent reasoning
-    },
-    {
-        "domain": "code",
-        "file": "data/apprentice_code.jsonl",
-        "specialist_steps": 300,
-        "seq_len": 512,
-        "distill_steps": 50,
-        "adversarial": 0.3,
-        "latent_stage": 4,  # Round 4: full latent
-    },
-    {
-        "domain": "research",
-        "file": "data/apprentice_research.jsonl",
-        "specialist_steps": 300,
-        "seq_len": 1024,
-        "distill_steps": 50,
-        "adversarial": 0.3,
-        "latent_stage": 4,  # Round 5: full latent
-    },
+    {"domain": "tool_caller", "file": "data/apprentice_tool_caller.jsonl",
+     "specialist_steps": 500, "seq_len": 256, "adversarial": 0.3},
+    {"domain": "planner", "file": "data/apprentice_planner.jsonl",
+     "specialist_steps": 300, "seq_len": 512, "adversarial": 0.3},
+    {"domain": "recovery", "file": "data/apprentice_recovery.jsonl",
+     "specialist_steps": 300, "seq_len": 256, "adversarial": 0.4},
+    {"domain": "code", "file": "data/apprentice_code.jsonl",
+     "specialist_steps": 300, "seq_len": 512, "adversarial": 0.3},
+    {"domain": "research", "file": "data/apprentice_research.jsonl",
+     "specialist_steps": 300, "seq_len": 1024, "adversarial": 0.3},
 ]
 
-Then router training using data/router_training.jsonl.
-
-The orchestration:
-1. Load backbone, init, LoRA apply
-2. For EACH round (rounds 1 through 5 — ALL of them):
-   a. Load domain dataset with correct latent_stage from ROUNDS config
-   b. train_specialist(backbone, dataset, domain, latent_stage=round_cfg["latent_stage"]) → adapter_weights
-      ↳ Backbone stays FROZEN. MTP is OFF. Latent stage from per-round config.
-   c. save_adapter(adapter_weights, domain, save_dir)
-   d. Load ALL completed specialists so far (including this round's new one)
-   e. distill_backbone(backbone, specialists, combined_data)
-      ↳ THIS MUST HAPPEN AFTER EVERY SPECIALIST, not just round 1.
-      ↳ Design doc explicitly requires: distill after rounds 1, 2, 3, 4, 5.
-      ↳ MTP is ON during distillation (backbone unfrozen). MTP starts after distill step 20.
-      ↳ After distillation: backbone now understands N domains. Future specialists start richer.
-   f. Print round summary (loss, tool_acc, interference)
-3. Train router:
-   a. Load router_training.jsonl
-   b. Create router model
-   c. router.train(dataset, backbone, tokenizer=tok)
-   d. Save router weights
-4. Final export: backbone + all adapters + router
+Orchestration:
+1. Load backbone via mlx_lm.load(), apply_lora() with Qwen target modules
+2. For each round:
+   a. train_specialist(backbone, tokenizer, dataset, domain) → adapter_weights
+   b. save_adapter(adapter_weights, domain, save_dir)
+   c. If --distill-only: distill_backbone(backbone, specialists, combined_data)
+   d. Print round summary
+3. Router training (--train-router): train router on cached hidden states
+4. Export: backbone + adapters + router
 
 CLI:
 python training_orchestrator.py \
-  --rounds 1-5 \           # which rounds to run (1=tool_caller, 2=planner, etc.)
-  --resume ./checkpoints \ # resume from saved state
-  --save-dir ./checkpoints
+  --rounds 1-5 --no-distill --save-dir ./checkpoints
+python training_orchestrator.py --rounds 1-5 --distill-only   # Phase C
+python training_orchestrator.py --train-router                  # Phase C
 
-Test with a mini run (2 steps per specialist, 1 step distill):
+Test:
 python -c "
-from training_orchestrator import run_round
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
+from mlx_lm import load as load_model
 from lora import apply_lora
-from init import init_agentmind
+from training_orchestrator import run_round
 import tempfile
 
-cfg = AgentMindConfig()
-backbone = AgentMind(cfg)
-backbone = init_agentmind(backbone, cfg)
-backbone = apply_lora(backbone)
-
-result = run_round(backbone, domain='tool_caller', 
-                   data_path='data/apprentice_tool_caller.jsonl',
-                   specialist_steps=2, distill_steps=1, save_dir=tempfile.mkdtemp())
-print('Round complete. Adapter saved at:', result.get('adapter_path'))
-print('Distillation loss:', result.get('distill_loss'))
+model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+model = apply_lora(model)
+result = run_round(model, tokenizer, domain='tool_caller',
+    data_path='data/apprentice_tool_caller.jsonl',
+    specialist_steps=2, save_dir=tempfile.mkdtemp())
+print('Adapter saved at:', result.get('adapter_path'))
 "
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: orchestration loop design, per-round config, checkpoint resume strategy, end-to-end flow
-- 💾 **Commit** with message: `training_orchestrator.py — round management loop for apprenticeship protocol`
+- 📝 **Update BUILD_LOG.md** — diary entry: Qwen orchestration, mlx_lm.load(), no latent stage
+- 💾 **Commit** with message: `training_orchestrator.py — Qwen round management (distillation opt-in)`
 ```
 
 ---
 
-### 🤖 Prompt 7 — Update eval.py with per-apprentice + interference
+### 🤖 Prompt 7 — Update eval.py with per-apprentice + interference (Qwen)
 ```
 Read the existing eval.py. Add two functions:
 
-1. evaluate_apprentice(model, adapter_weights, domain_dataset, tok, cfg) -> dict
-   - Load adapter into backbone via model.load_lora()
-   - Run existing metrics: compute_loss, evaluate_tool_calls, format_adherence
+1. evaluate_apprentice(model, tokenizer, adapter_weights, domain_dataset) -> dict
+   - Load adapter via load_lora()
+   - Run: compute_loss on held-out data, evaluate_tool_calls (parse <|tool_call|> JSON),
+     format_adherence (check <|tool_call|>...<|observe|> structure)
    - Return {"loss": float, "tool_acc": float, "format": dict}
 
-2. test_interference(model, adapters: dict, test_fn, tok, cfg) -> (baselines, interference)
+2. test_interference(model, tokenizer, adapters: dict) -> (baselines, interference)
    - For each adapter: load, run test_fn, record baseline
-   - For each pair (A, B): load A, test, load B, test, compute diff
-   - Return baselines dict + interference dict
-   - Interference > 5% triggers warning: "SPECIALIST INTERFERENCE DETECTED"
+   - For each pair: load A→test→load B→test, compute diff
+   - Interference > 5% triggers warning
+
+Note: model is loaded via mlx_lm.load(), tokenizer is Qwen's AutoTokenizer.
+No AgentMindConfig, no sentencepiece, no agentmind_tok.model.
 
 Test:
 python -c "
+from mlx_lm import load as load_model
+from lora import apply_lora, load_lora
 from eval import evaluate_apprentice, test_interference
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
-from lora import apply_lora
-import sentencepiece as spm
 
-cfg = AgentMindConfig()
-model = AgentMind(cfg)
-tok = spm.SentencePieceProcessor()
-tok.load('agentmind_tok.model')
+model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+model = apply_lora(model)
 
-# Quick smoke test
 from data.pipeline import AgentDataset
-ds = AgentDataset(['data/apprentice_tool_caller.jsonl'], tokenizer=tok, cfg=cfg, split='train')
+ds = AgentDataset('data/apprentice_tool_caller.jsonl', tokenizer=tokenizer)
 
-# Dummy adapter (just use current LoRA weights)
-adapters = {'tool_caller': {k: v for k, v in model.trainable_parameters().items() if not k.startswith('last_')}}
-result = evaluate_apprentice(model, adapters['tool_caller'], ds, tok, cfg)
+adapter_weights = dict(model.trainable_parameters())
+result = evaluate_apprentice(model, tokenizer, adapter_weights, ds)
 print('Apprentice eval:', result)
 "
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: per-apprentice eval metrics, interference testing, what constitutes >5% interference and why
-- 💾 **Commit** with message: `eval.py — per-apprentice evaluation + interference detection`
+- 📝 **Update BUILD_LOG.md** — diary entry: Qwen eval, tool call accuracy, interference detection
+- 💾 **Commit** with message: `eval.py — per-apprentice evaluation for Qwen + interference detection`
 ```
 
 ---
 
-### 🤖 Prompt 8 — Rewrite agent.py with router-aware AgentLoop
+### 🤖 Prompt 8 — Write agent.py with manual adapter selection (Phase A), optional router (Phase C)
 ```
-Read docs/cognitive_apprenticeship.md — the "Inference Flow: Router-Aware Agent Loop" section.
+Read docs/cognitive_apprenticeship.md.
 Read agent.py (currently empty stub).
 
-Implement the full AgentLoop class with router dispatch + adapter swapping + SSM state persistence.
+Implement AgentLoop that supports two modes:
+
+Mode 1 (Phase A/B — manual adapter selection):
+  python agent.py --backbone Qwen/Qwen2.5-0.5B --adapter ./path.safetensors --query "..."
+  - Single fixed adapter loaded at startup, no router involved
+  - KV cache persists across turns within the same session
+
+Mode 2 (Phase C — router dispatch):
+  python agent.py --backbone Qwen/Qwen2.5-0.5B --adapters ./dir/ --router ./path --query "..."
+  - Router selects specialist per turn based on last hidden state
+  - Falls back to "tool_caller" if confidence < 0.6
 
 Key design:
-- SSM state (h_states) persists across entire session — NOT reset on specialist switch
-- Router runs on backbone hidden state (before specialist bias)
-- Fallback to "tool_caller" if router confidence < 0.6
-- Adapter swapping is cheap (~9MB, <1ms on Apple Unified Memory)
+- KV cache persists across entire session — NOT reset on specialist switch
+- Adapter swapping is fast (~9MB, <1ms on Apple Unified Memory)
+- In Phase A/B mode: no router instantiated, adapter is fixed
 
 Implementation:
 class AgentLoop:
-    def __init__(self, backbone, router, adapters: dict, tok, tools: dict, cfg):
-        self.backbone = backbone      # AgentMind-147M
-        self.router = router          # TaskRouter instance
-        self.adapters = adapters      # {"tool_caller": weights_dict, ...}
-        self.tok = tok
-        self.tools = tools            # {"tool_name": callable}
-        self.cfg = cfg
-        self.h_states = {}            # SSM state — persists entire session
-        self.active_adapter = None
+    def __init__(self, model, tokenizer, adapter_path=None, adapters_dir=None, router=None, tools=None):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.cache = []
 
-    def _select_specialist(self, hidden_state):
-        # Pass the last-position slice [B, 1, d_model] to the router.
-        # router.__call__ handles both [B, L, D] and [B, D] — it always extracts
-        # the last position. Passing [:, -1:, :] (shape [B, 1, D]) is consistent
-        # with how router.py's __call__ works and matches the design doc (last_hidden).
-        # Do NOT use mean-pooling here — that would break the train/infer parity
-        # established in router.py (see Prompt 2 reconciliation).
-        logits = self.router(hidden_state[:, -1:, :])  # [B, 1, D] → router extracts last pos
-        return self.router.select_expert(hidden_state[:, -1:, :], threshold=0.6)
+        if adapter_path:
+            # Phase A/B: single fixed adapter, no router
+            self.fixed_adapter = load_adapter_weights(adapter_path)
+            self.model.load_lora(self.fixed_adapter)
+            self.adapter_mode = "fixed"
+        elif adapters_dir and router:
+            # Phase C: router dispatch
+            self.adapters = load_all_adapters(adapters_dir)
+            self.router = router
+            self.adapter_mode = "routed"
+            self.active_adapter = None
 
-    def _load_adapter(self, name):
-        if self.active_adapter != name:
-            self.backbone.load_lora(self.adapters[name])
-            self.active_adapter = name
+    def run(self, user_query, max_tokens=200, temp=0.7):
+        # 1. Build prompt, tokenize
+        # 2. If routed mode: forward backbone → router → load adapter
+        # 3. Generate with KV cache (generate_step)
+        # 4. Tool call handling: pause → execute → observe → continue
+        # 5. Return response
 
-    def run(self, user_query, max_tokens=200, temp=0.7, top_p=0.9):
-        # 1. Build prompt with system + user + assistant prefix
-        # 2. Tokenize
-        # 3. Backbone forward for router (with SSM state)
-        # 4. Router dispatch
-        # 5. Load specialist adapter
-        # 6. Generate with forward_with_state + sampling
-        # 7. Tool call handling (pause → execute → observe → continue)
-        # 8. Return response string
-
-    def sample(logits, temp, top_p):
-        # Temperature + top-p nucleus sampling
-        # Same as the old design
-
-Wire 3 real tools (from original design):
+Wire 3 real tools:
 - web_search(query) — DuckDuckGo lite or requests
 - run_python(code) — subprocess with timeout=10s
 - read_file(path) — open and read, max 10KB
 
-Test:
+Phase A test (manual adapter):
 python agent.py \
-  --backbone ./apprentice-system-4bit/backbone \
-  --adapters ./apprentice-system-4bit/adapters \
-  --router ./apprentice-system-4bit/router \
-  --query "Search arxiv for recent papers on Mamba SSMs and summarize the findings"
+  --backbone Qwen/Qwen2.5-0.5B \
+  --adapter ./checkpoints/adapters/tool_caller.safetensors \
+  --query "Search arxiv for recent papers on Mamba SSMs"
+
+Phase C test (router):
+python agent.py \
+  --backbone Qwen/Qwen2.5-0.5B \
+  --adapters ./checkpoints/adapters \
+  --router ./checkpoints/router \
+  --query "Search arxiv for recent papers on Mamba SSMs"
 ```
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: AgentLoop with router dispatch, SSM state persistence philosophy (don't reset on specialist switch), live tool wiring
-- 💾 **Commit** with message: `agent.py — router-aware AgentLoop with SSM state persistence across specialist switches`
+- 📝 **Update BUILD_LOG.md** — diary entry: AgentLoop modes (fixed vs routed), KV cache persistence, tool wiring
+- 💾 **Commit** with message: `agent.py — AgentLoop with manual + routed adapter selection`
 
 ---
 
-## Phase 1 — Round 1: Tool Caller
+## Phase A: Tool-Caller Specialist (Proof of Agency)
+
+Goal: can the model reliably do one tool call, observe, and continue. No router, no distillation, no planner.
 
 ### 👤 Human Step 1 — Train tool_caller specialist
 ```bash
 cd agentmind
 python training_orchestrator.py --rounds 1
 ```
-> Trains the first specialist (tool_caller) for 500 steps at seq_len=256.
-> Adversarial rate: 30%. Backbone frozen; only 2.36M LoRA params train.
-> Expected: ~15 minutes on M-series MacBook Air.
+> Trains tool_caller LoRA for 500 steps at seq_len=256.
+> Backbone frozen; LoRA only. No distillation after.
 > Watch for loss < 3.0 by step 200, tool_acc emerging by step 300.
 >
 > After completion:
-> - 📝 **Update BUILD_LOG.md** — training diary: loss curve, convergence behavior, any NaNs or instabilities, tool_acc emergence
-> - 💾 **Commit** with message: `round 1 — tool_caller specialist trained (loss=X, tool_acc=X%)`
+> - 📝 **Update BUILD_LOG.md** — training diary: loss curve, convergence behavior, tool_acc emergence
+> - 💾 **Commit** with message: `Phase A — tool_caller specialist trained (loss=X, tool_acc=X%)`
 
-### 👤 Human Step 2 — Monitor first distillation
+### 👤 Human Step 2 — Run manual adapter agent test
 ```bash
-python training_orchestrator.py --rounds 1 --distill-only
+python agent.py \
+  --backbone Qwen/Qwen2.5-0.5B \
+  --adapter ./checkpoints/adapters/tool_caller.safetensors \
+  --query "Search arxiv for Mamba SSM papers and summarize the findings"
 ```
-> Runs 50-step distillation: backbone unfrozen, trained with CE + KL(backbone || tool_caller) + MTP.
-> After this, backbone understands tool protocol. Future specialists start from higher base.
+> No router yet — adapter loaded manually via `--adapter`.
+> Expected: model emits `<|tool_call|>`, observes result, continues coherently.
 >
 > After completion:
-> - 📝 **Update BUILD_LOG.md** — diary entry: distillation loss vs baseline, KL divergence behavior, backbone capacity observations
-> - 💾 **Commit** with message: `round 1 — backbone distilled with tool_caller (distill_loss=X, beta=0.5)`
+> - 📝 **Update BUILD_LOG.md** — diary entry: tool call success rate, observation handling, continuation quality
+> - 💾 **Commit** with message: `Phase A — tool_caller agent test (tool_call=X%, continuation=pass/fail)`
 
 ---
 
-## Phase 2 — Rounds 2-5: Remaining Specialists
+## Phase B: Adversarial Robustness
 
-### 👤 Human Step 3 — Train remaining specialists
+Goal: tool_caller handles malformed observations, timeouts, retries, partial failures.
+
+### 👤 Human Step 3 — Train adversarial variants
+```bash
+python training_orchestrator.py --rounds 1 --adversarial-only --adversarial-rate 0.6
+```
+> Use the existing adversarial augmentation from `augmentation/adversarial_mutator.py` and `observation_mutator.py`.
+> Train the same tool_caller adapter on failure-heavy data (60% adversarial rate).
+> Tests: malformed JSON responses, timeout signals, rate limiting, partial results, permission errors.
+>
+> After completion:
+> - 📝 **Update BUILD_LOG.md** — diary entry: adversarial training loss, which failure modes it handles, which it struggles with
+> - 💾 **Commit** with message: `Phase B — tool_caller adversarial robustness (failure_modes_handled=X/8)`
+
+---
+
+## Phase C: Multi-Specialist + Router + Distillation
+
+Goal: remaining specialists, then learned routing, then distillation.
+
+### 👤 Human Step 4 — Train remaining specialists (no distillation)
 ```bash
 # Round 2: Planner (300 steps, seq_len=512)
-python training_orchestrator.py --rounds 2
+python training_orchestrator.py --rounds 2 --no-distill
 
-# Round 3: Recovery (300 steps, seq_len=256, 40% adversarial)
-python training_orchestrator.py --rounds 3
+# Round 3: Recovery (300 steps, seq_len=256)
+python training_orchestrator.py --rounds 3 --no-distill
 
 # Round 4: Code (300 steps, seq_len=512)
-python training_orchestrator.py --rounds 4
+python training_orchestrator.py --rounds 4 --no-distill
 
 # Round 5: Research (300 steps, seq_len=1024)
-python training_orchestrator.py --rounds 5
+python training_orchestrator.py --rounds 5 --no-distill
 ```
-> Each specialist starts with N-1 domains already embedded in backbone.
-> Fewer steps needed (300 vs 500) because tool protocol is already learned.
-> Each followed by automatic 50-step distillation with MTP.
-> Total: ~70 minutes across all 5 rounds + distillations.
+> Each specialist trains independently with `--no-distill`.
+> Verify each manually: `python agent.py --adapter ./checkpoints/adapters/{domain}.safetensors --query "..."`.
 >
 > After completion:
-> - 📝 **Update BUILD_LOG.md** — per-round diary: loss, tool_acc, interference measurements, any cross-domain bleed
-> - 💾 **Commit** per round with message: `round N — <domain> specialist (loss=X, tool_acc=X%)`
+> - 📝 **Update BUILD_LOG.md** — per-round diary: loss, tool_acc, interference measurements
+> - 💾 **Commit** per round with message: `Phase C — <domain> specialist trained (loss=X, tool_acc=X%)`
 
----
-
-## Phase 3 — Router Training
-
-### 👤 Human Step 4 — Train the router
+### 👤 Human Step 5 — Train the router
 ```bash
 python training_orchestrator.py --train-router
 ```
+> Only after ALL 5 specialists are trained and independently verified.
 > Collects backbone hidden states for 1500 samples (300 per domain).
-> Trains 65K-param router classifier for 200 steps.
-> Verify accuracy > 85% on holdout set.
+> Train 65K-param classifier for 200 steps. Verify accuracy > 85%.
 > Fallback to "tool_caller" when confidence < 0.6.
 >
 > After completion:
-> - 📝 **Update BUILD_LOG.md** — diary entry: router accuracy, confusion matrix (which domains get confused), fallback rate
-> - 💾 **Commit** with message: `router trained — accuracy=X% on holdout, fallback threshold=0.6`
+> - 📝 **Update BUILD_LOG.md** — diary entry: router accuracy, confusion matrix, fallback rate
+> - 💾 **Commit** with message: `Phase C — router trained (accuracy=X%, fallback threshold=0.6)`
 
----
-
-## Phase 4 — Export + Inference
+### 👤 Human Step 6 — Distillation (optional, only if specialists diverge)
+```bash
+python training_orchestrator.py --rounds 1-5 --distill-only
+```
+> Only run this AFTER specialists visibly diverge and are independently proven.
+> Distillation blends specialist behaviors back into backbone.
+> If specialists aren't meaningfully different, skip distillation entirely.
+>
+> After completion:
+> - 📝 **Update BUILD_LOG.md** — diary entry: distillation loss vs baseline, KL divergence, whether it improved anything
+> - 💾 **Commit** with message: `Phase C — backbone distilled with N specialists (distill_loss=X)`
 
 ### 🤖 Prompt 9 — Write export_apprentice.py
 ```
@@ -831,7 +662,6 @@ export_system(
     output_dir='./apprentice-system-4bit',
     bits=4
 )
-# Verify files exist
 import os
 for f in ['backbone.safetensors', 'config.json', 'tokenizer.model']:
     assert os.path.exists(f'./apprentice-system-4bit/{f}')
@@ -842,29 +672,28 @@ print('Export verified: all 3 artifacts present')
 "
 
 After it passes:
-- 📝 **Update BUILD_LOG.md** — diary entry: export format rationale (backbone + adapters, not monolithic), why multi-adapter GGUF, 4-bit quantization, inference setup
+- 📝 **Update BUILD_LOG.md** — diary entry: export format rationale (backbone + adapters, not monolithic)
 - 💾 **Commit** with message: `export_apprentice.py — multi-adapter export (backbone + 5 specialists + router)`
 ```
 
-### 👤 Human Step 5 — Run end-to-end agent test
+### 👤 Human Step 7 — Run end-to-end agent test (with router)
 ```bash
 python agent.py \
-  --backbone ./apprentice-system-4bit/backbone \
-  --adapters ./apprentice-system-4bit/adapters \
-  --router ./apprentice-system-4bit/router \
+  --backbone Qwen/Qwen2.5-0.5B \
+  --adapters ./checkpoints/adapters \
+  --router ./checkpoints/router \
   --query "Search arxiv for recent Mamba SSM papers and summarize the key findings"
 ```
 Expected behavior:
 1. Backbone encodes query
-2. Router selects "research" specialist
-3. Specialist generates tool call: search_arxiv
+2. Router selects specialist
+3. Specialist generates tool call
 4. Result observed
 5. Summary generated
-6. SSM state carries context across all turns
 
 After completion:
-- 📝 **Update BUILD_LOG.md** — diary entry: end-to-end results, router dispatch quality, generation quality, tool call success rate, any failures
-- 💾 **Commit** with message: `end-to-end agent test — router=X%, tool_calls=X%, summary: <brief assessment>`
+- 📝 **Update BUILD_LOG.md** — diary entry: end-to-end results, router dispatch quality, tool call success rate
+- 💾 **Commit** with message: `Phase C — end-to-end agent test (router=X%, tool_calls=X%)`
 
 ---
 
@@ -873,19 +702,23 @@ After completion:
 ### NaN loss during specialist training
 ```
 My tool_caller specialist training is producing NaN loss from step 1.
-The backbone was randomly initialized.
-Check if the LoRA A matrix init (random normal / sqrt(rank)) is numerically stable.
-Also check if the cross_entropy_loss handles edge cases correctly (all -100 mask).
+The backbone is Qwen2.5-0.5B (pretrained, not random).
+Check:
+1. Is the LoRA init scale correct? (A: normal/sqrt(rank), B: zeros)
+2. Does cross_entropy_loss handle all -100 mask correctly?
+3. Is the learning rate too high for pretrained weights? Try 1e-4 instead of 2e-4.
+4. Are there extreme logits from the pretrained model on new special tokens?
 ```
 
 ### Router accuracy below 50%
 ```
-My TaskRouter is only getting ~40% accuracy despite training for 200 steps.
-The backbone hidden states might not differentiate between domains yet.
+My TaskRouter (d_model=512) is only getting ~40% accuracy despite training for 200 steps.
 Check:
 1. Are the domain datasets truly distinct? (Compare token distributions)
-2. Is the backbone trained enough? (Early rounds → weak hidden state signal)
+2. Does Qwen's backbone produce differentiated hidden states for different domains?
+   (Test: run a few samples, check last-hidden cosine similarity across domains)
 3. Is the router's hidden dimension (64) too small? Try 128.
+4. Make sure you're extracting from model.model (inner transformer), not model output.
 ```
 
 ### Specialist interference > 10%
@@ -899,34 +732,39 @@ Mitigations to try in order:
    loss = task_loss + beta * KL + mtp_aux + gamma * sum(CE(backbone, specialist_B) for B != correct)
 ```
 
-### Agent inference returns wrong specialist
+### Agent inference returns wrong specialist (Phase C only)
 ```
 My agent always selects "tool_caller" regardless of the query.
 Check:
 1. Is the router loaded correctly from the exported .safetensors?
-2. Does the backbone produce different hidden states for different domains?
+2. Does Qwen's backbone produce different hidden states for different domains?
+   (Run a few samples and check last-hidden cosine similarity)
 3. Is the fallback threshold (0.6) too high? Try 0.3.
-4. Run: python -c "from agent import diagnose_router; diagnose_router(backbone, router, test_queries)"
+4. Run: diagnose_router(backbone, router, test_queries)
+
+Note: In Phase A/B, there is no router — adapter is loaded manually via --adapter.
+If the wrong adapter loads, check load_lora() for correct weight mapping.
 ```
 ---
 
 ## Summary — What You Do vs Claude Code
 
 | Step | Who | Log + Commit |
-|---|---|---|---|
-| Prepare per-domain HF + synthetic data (25-50K/domain) | 🤖 Claude Code | ✅ Required |
+|---|---|---|
+| Synthetic data pipeline | ✅ Already done (`generate_scaled_synthetic.py` + `augmentation/`) | N/A |
 | Write apprentice.py (CognitiveApprentice) | 🤖 Claude Code | ✅ Required |
-| Write router.py (TaskRouter) | 🤖 Claude Code | ✅ Required |
+| Write router.py (TaskRouter) | 🤖 Claude Code | ✅ Required (Phase C use) |
 | Update lora.py (save/load/reset adapter) | 🤖 Claude Code | ✅ Required |
-| Add load_lora() to AgentMind | 🤖 Claude Code | ✅ Required |
 | Refactor train.py (train_specialist + distill_backbone) | 🤖 Claude Code | ✅ Required |
-| Write training_orchestrator.py | 🤖 Claude Code | ✅ Required |
+| Write training_orchestrator.py (`--no-distill` default) | 🤖 Claude Code | ✅ Required |
 | Update eval.py (per-apprentice, interference) | 🤖 Claude Code | ✅ Required |
-| Rewrite agent.py (router-aware AgentLoop) | 🤖 Claude Code | ✅ Required |
+| Write agent.py (manual + routed adapter modes) | 🤖 Claude Code | ✅ Required |
 | Write export_apprentice.py | 🤖 Claude Code | ✅ Required |
-| Start Round 1 training (tool_caller) | 👤 You | ✅ Record results |
-| Monitor first distillation | 👤 You | ✅ Record results |
-| Run Rounds 2-5 sequentially | 👤 You | ✅ Per-round log |
-| Train router | 👤 You | ✅ Record accuracy |
-| Run end-to-end agent test | 👤 You | ✅ Record assessment |
+| **Phase A** — Train tool_caller specialist | 👤 You | ✅ Record loss + tool_acc |
+| **Phase A** — Manual adapter agent test | 👤 You | ✅ Assess tool call + continuation |
+| **Phase B** — Adversarial robustness training | 👤 You | ✅ Record failure modes handled |
+| **Phase C** — Train remaining specialists (no distill) | 👤 You | ✅ Per-round log |
+| **Phase C** — Train router | 👤 You | ✅ Record accuracy |
+| **Phase C** — Distillation (optional) | 👤 You | ✅ Record if improved |
+| **Phase C** — End-to-end agent test | 👤 You | ✅ Record assessment |
 | Debug any issues | 🤖 Claude Code | ✅ As needed |

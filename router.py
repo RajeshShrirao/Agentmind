@@ -4,12 +4,10 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 from pathlib import Path
-from training_utils import format_sample
-from stats_logger import GLOBAL as log
 
 
 class TaskRouter(nn.Module):
-    def __init__(self, d_model=1024, hidden=64, n_domains=5, domain_names=None):
+    def __init__(self, d_model=512, hidden=64, n_domains=5, domain_names=None):
         super().__init__()
         self.classifier = nn.Sequential(
             nn.Linear(d_model, hidden),
@@ -38,32 +36,26 @@ class TaskRouter(nn.Module):
 
         domain_to_id = {name: i for i, name in enumerate(self.domain_names)}
 
-        # ── Cache hidden states: one 147M forward pass per sample ──
         cached = []
         for sample in dataset:
             domain = sample["domain"]
             messages = sample["messages"]
             label = domain_to_id[domain]
 
-            if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-                if tokenizer is None:
-                    raise ValueError(
-                        "tokenizer required when messages are raw dicts; "
-                        "pass a SentencePiece tokenizer with .encode(text, add_bos=True)"
-                    )
-                text = format_sample({"messages": messages})
-                token_ids = tokenizer.encode(text, add_bos=True)
-            else:
-                token_ids = messages
+            if tokenizer is None:
+                raise ValueError("tokenizer required for router training")
 
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            token_ids = tokenizer.encode(text)
             ids = mx.array([token_ids])
-            backbone.forward_with_state(ids, {})
-            # cache only last-token hidden state — (1, d_model), ~4KB per sample
-            cached.append((backbone.last_hidden[:, -1, :], label, domain))
+            hidden = backbone.model(ids)[0]
+            last_hidden = hidden[:, -1, :]
+            cached.append((last_hidden, label, domain))
 
         print(f"  Cached {len(cached)} hidden states (one forward pass each)")
 
-        # ── Train classifier on cached states ──
         optimizer = optim.Adam(learning_rate=lr)
         loss_fn = nn.losses.cross_entropy
         t_start = time.time()
@@ -101,8 +93,6 @@ class TaskRouter(nn.Module):
                     for d, v in per_domain.items()
                 )
                 print(f"[router] step {step}/{steps}  loss={avg_loss:.4f}  acc={acc:.1f}%  [{per_domain_acc}]")
-                log.step("router", step, steps, avg_loss, acc=acc,
-                         per_domain_acc=per_domain_acc)
 
         elapsed = time.time() - t_start
         total_correct = sum(v["correct"] for v in per_domain.values())
@@ -114,8 +104,6 @@ class TaskRouter(nn.Module):
         final_acc = total_correct / total_all * 100
         print(f"[router] Complete ({steps} steps, {elapsed:.0f}s) "
               f"acc={final_acc:.1f}%  [{per_domain_acc}]")
-        log.summary("router", steps=steps, elapsed=elapsed, acc=final_acc,
-                    per_domain_acc=per_domain_acc)
         return self
 
     def save(self, path):

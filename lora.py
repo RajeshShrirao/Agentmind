@@ -35,7 +35,7 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
       LM head
     """
     if targets is None:
-        targets = ["in_proj", "out_proj", "o_proj", "q_proj", "v_proj", "lm_head"]
+        targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     # Freeze entire model first
     model.freeze()
@@ -62,6 +62,22 @@ def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = 
     # Count trainable params
     total = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
     print(f"LoRA applied | Trainable params: {total:,} ({total/1e6:.2f}M)")
+    return model
+
+
+def load_lora(model, adapter_weights: dict):
+    '''
+    Load LoRA A/B weights into an MLX model with LoRALinear layers.
+    adapter_weights: dict of {"layer_name.A": mx.array, "layer_name.B": ...}
+
+    The model already has LoRALinear layers applied from apply_lora().
+    This just updates A and B matrices of existing LoRALinear layers.
+    Works with Qwen2.5 or any MLX model using the same target module names.
+    '''
+    nested = tree_unflatten(adapter_weights)
+    model.update(nested)
+    loaded_params = sum(v.nbytes for v in adapter_weights.values()) // 1024
+    print(f"[lora] Loaded {len(adapter_weights)} LoRA parameter tensors ({loaded_params} KB)")
     return model
 
 

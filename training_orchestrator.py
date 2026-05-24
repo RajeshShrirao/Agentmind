@@ -1,27 +1,25 @@
 """
-training_orchestrator.py — Round management loop for the apprenticeship protocol.
+training_orchestrator.py — Round management loop for Qwen2.5-based AgentMind.
 
 Usage:
   python training_orchestrator.py --rounds 1-5 --save-dir ./checkpoints
-  python training_orchestrator.py --rounds 1-3 --resume ./checkpoints --save-dir ./checkpoints
+  python training_orchestrator.py --rounds 1-5 --no-distill --save-dir ./checkpoints
+  python training_orchestrator.py --rounds 1-5 --distill-only
+  python training_orchestrator.py --train-router
 """
 
 import json, os, argparse, time
 from pathlib import Path
 
 import mlx.core as mx
+from mlx_lm import load as load_model
 from mlx.utils import tree_flatten
 
-from config import AgentMindConfig, APPRENTICE_ROUNDS
-from model.agent_lm import AgentMind
+from config import APPRENTICE_ROUNDS
 from data.pipeline import AgentDataset
-from lora import apply_lora, save_adapter, reset_adapter
-from init import init_agentmind
+from lora import apply_lora, save_adapter, reset_adapter, load_adapter
 from train import train_specialist, distill_backbone
 from router import TaskRouter
-from training_utils import _nested_weights
-from monitor import print_hw
-from stats_logger import GLOBAL as log
 
 
 def parse_rounds(rounds_spec: str) -> list[int]:
@@ -37,16 +35,13 @@ def parse_rounds(rounds_spec: str) -> list[int]:
     return sorted(set(result))
 
 
-def load_domain_data(data_path: str, backbone, latent_stage: int = 1):
-    from tokenizer_setup import load_tokenizer
-    tok = load_tokenizer("agentmind_tok.model")
-    ds = AgentDataset.from_raw([data_path], tokenizer=tok, cfg=backbone.cfg)
-    ds.latent_stage = latent_stage
-    print(f"  Loaded {len(ds.samples)} samples from {data_path} (latent_stage={latent_stage})")
+def load_domain_data(data_path, tokenizer):
+    ds = AgentDataset.from_raw(data_path, tokenizer=tokenizer)
+    print(f"  Loaded {len(ds.samples)} samples from {data_path}")
     return ds
 
 
-def gather_combined_data(completed_rounds: list[dict]) -> list[dict]:
+def gather_combined_data(completed_rounds):
     combined = []
     for r in completed_rounds:
         path = Path(r["file"])
@@ -62,17 +57,17 @@ def gather_combined_data(completed_rounds: list[dict]) -> list[dict]:
     return combined
 
 
-def load_adapter_weights(adapter_path: str) -> dict:
+def load_adapter_weights(adapter_path):
     loaded = mx.load(adapter_path)
     if 'metadata' in loaded:
         del loaded['metadata']
     return loaded
 
 
-def train_router(backbone, cfg, tok, save_dir):
+def train_router(backbone, tokenizer, save_dir):
     domain_names = [r["domain"] for r in APPRENTICE_ROUNDS]
     router = TaskRouter(
-        d_model=cfg.d_model,
+        d_model=512,
         hidden=64,
         n_domains=len(domain_names),
         domain_names=domain_names,
@@ -86,7 +81,7 @@ def train_router(backbone, cfg, tok, save_dir):
         for line in f:
             router_data.append(json.loads(line.strip()))
     print(f"  Loaded {len(router_data)} router training samples")
-    router.train(router_data, backbone, tokenizer=tok, steps=200, lr=1e-3)
+    router.train(router_data, backbone, tokenizer=tokenizer, steps=200, lr=1e-3)
     router_save_path = str(save_dir / "router")
     router.save(router_save_path)
 
@@ -96,61 +91,57 @@ def export_backbone(backbone, save_dir):
     print("  Saving final artifacts")
     print(f"{'='*60}")
     backbone_path = save_dir / "backbone.safetensors"
-    backbone_params = {k: v for k, v in tree_flatten(backbone.parameters())
-                       if not k.startswith("last_")}
+    backbone_params = {k: v for k, v in tree_flatten(backbone.parameters())}
     mx.save_safetensors(str(backbone_path), dict(backbone_params))
     print(f"  Backbone saved -> {backbone_path}")
 
 
-def run_round(backbone, domain: str, data_path: str,
-              specialist_steps: int, distill_steps: int, save_dir: str,
-              seq_len: int = 256, latent_stage: int = 1,
-              seq_len_schedule: dict = None,
-              existing_adapters: dict = None) -> dict:
+def run_round(backbone, tokenizer, domain, data_path,
+              specialist_steps, save_dir, seq_len=256,
+              seq_len_schedule=None, do_distill=False,
+              distill_steps=50, existing_adapters=None):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     reset_adapter(backbone)
-    dataset = load_domain_data(data_path, backbone, latent_stage=latent_stage)
+    dataset = load_domain_data(data_path, tokenizer)
 
     print(f"\n{'='*60}")
     print(f"  Training specialist: {domain}")
-    print(f"  Steps: {specialist_steps} | Seq len: {seq_len} | Latent stage: {latent_stage}")
+    print(f"  Steps: {specialist_steps} | Seq len: {seq_len}")
     print(f"{'='*60}")
 
     adapter_weights = train_specialist(
-        backbone, dataset, domain,
-        steps=specialist_steps, seq_len=seq_len, latent_stage=latent_stage,
-        seq_len_schedule=seq_len_schedule, syntax_aux_weight=0.2
+        backbone, tokenizer, dataset, domain,
+        steps=specialist_steps, seq_len=seq_len,
+        seq_len_schedule=seq_len_schedule,
     )
 
     save_adapter(backbone, domain, str(save_dir))
     adapter_path = str(save_dir / f"{domain}.safetensors")
 
-    specialists = dict(existing_adapters or {})
-    specialists[domain] = adapter_weights
-    print(f"  Specialists for distillation: {list(specialists.keys())}")
-
-    existing_domains = list(existing_adapters.keys()) if existing_adapters else []
-    completed_domains = existing_domains + [domain]
-    rounds_for_data = [r for r in APPRENTICE_ROUNDS if r["domain"] in completed_domains]
-    combined = gather_combined_data(rounds_for_data)
-
-    reset_adapter(backbone)
-    distill_seq_len = min(seq_len, 512)
-    print(f"\n  Distilling backbone ({distill_steps} steps, seq_len={distill_seq_len}, latent_stage={latent_stage})")
-    final_loss = distill_backbone(
-        backbone, specialists, combined,
-        steps=distill_steps, seq_len=distill_seq_len, latent_stage=latent_stage,
-        mtp_weight=0.2
-    )
-
-    return {
+    result = {
         "domain": domain,
         "adapter_path": adapter_path,
-        "latent_stage": latent_stage,
-        "distill_loss": final_loss if final_loss is not None else None,
     }
+
+    if do_distill and existing_adapters:
+        specialists = dict(existing_adapters)
+        specialists[domain] = adapter_weights
+
+        existing_domains = list(existing_adapters.keys()) if existing_adapters else []
+        completed_domains = existing_domains + [domain]
+        rounds_for_data = [r for r in APPRENTICE_ROUNDS if r["domain"] in completed_domains]
+        combined = gather_combined_data(rounds_for_data)
+
+        reset_adapter(backbone)
+        print(f"\n  Distilling backbone ({distill_steps} steps, seq_len={min(seq_len, 512)})")
+        distill_backbone(
+            backbone, specialists, combined, tokenizer,
+            steps=distill_steps, seq_len=min(seq_len, 512),
+        )
+
+    return result
 
 
 def main():
@@ -161,122 +152,109 @@ def main():
                         help="Path to checkpoint dir to resume from")
     parser.add_argument("--save-dir", type=str, default="./checkpoints",
                         help="Directory to save checkpoints")
+    parser.add_argument("--no-distill", action="store_true", default=False,
+                        help="Skip distillation after each round")
+    parser.add_argument("--distill-only", action="store_true", default=False,
+                        help="Only run distillation on existing adapters, skip specialist training")
+    parser.add_argument("--train-router", action="store_true", default=False,
+                        help="Train the task router on cached hidden states")
     args = parser.parse_args()
-
-    round_indices = parse_rounds(args.rounds)
-    print(f"Rounds to run: {[i+1 for i in round_indices]}")
 
     t_start = time.time()
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     adapters_dir = save_dir / "adapters"
+    adapters_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = AgentMindConfig()
-    from tokenizer_setup import load_tokenizer, get_token_ids, hydrate_config
-    tok = load_tokenizer("agentmind_tok.model")
-    ids = get_token_ids(tok)
-    hydrate_config(cfg, tok)
-    print("Config token IDs hydrated from tokenizer.")
+    # Load backbone
+    print(f"Loading backbone (Qwen/Qwen2.5-0.5B)...")
+    model, tokenizer = load_model("Qwen/Qwen2.5-0.5B")
 
-    backbone = AgentMind(cfg)
-    backbone = init_agentmind(backbone, cfg)
+    # Add special tokens to underlying HF tokenizer
+    special_tokens = [
+        "<|tool_call|>", "<|plan|>", "<|memory|>", "<|scratch|>", "<|observe|>",
+        "<|think_start|>", "<|think_end|>", "<|system|>", "<|user|>", "<|assistant|>",
+    ]
+    tokenizer._tokenizer.add_tokens(special_tokens)
+    # Embedding (151936 slots) already has room for these tokens
 
-    default_backbone = Path(args.save_dir) / "backbone.npz"
-    if default_backbone.exists():
-        weights = mx.load(str(default_backbone))
-        backbone.update(_nested_weights(weights))
-        print(f"Loaded pretrained backbone from {default_backbone}")
+    # Apply LoRA
+    model = apply_lora(model)
+    print(f"Model initialized. Trainable params: "
+          f"{sum(p.size for _,p in tree_flatten(model.trainable_parameters())):,}")
 
-    completed_domains = set()
-    if args.resume:
-        resume_dir = Path(args.resume)
-        if resume_dir.exists():
-            backbone_path = resume_dir / "backbone.npz"
-            if backbone_path.exists():
-                weights = mx.load(str(backbone_path))
-                backbone.update(_nested_weights(weights))
-                print(f"Resumed backbone from {backbone_path}")
-            adapters_dir = resume_dir / "adapters"
-            if adapters_dir.exists():
-                for f in adapters_dir.glob("*.safetensors"):
-                    completed_domains.add(f.stem)
-                    print(f"  Found completed adapter: {f.stem}")
-        else:
-            print(f"Resume dir {resume_dir} not found — starting fresh")
+    if args.train_router:
+        train_router(model, tokenizer, save_dir)
+        export_backbone(model, save_dir)
+        return
 
-    backbone = apply_lora(backbone, rank=32, alpha=32.0)
-    print(f"Backbone initialized. Trainable params: "
-          f"{sum(p.size for _,p in tree_flatten(backbone.trainable_parameters())):,}")
-
-    log.phase("orchestrator", "start", rounds=args.rounds)
-    print_hw("start")
+    round_indices = parse_rounds(args.rounds)
+    print(f"Rounds to run: {[i+1 for i in round_indices]}")
 
     all_adapter_weights = {}
     completed_round_entries = []
 
     for idx in round_indices:
         round_cfg = APPRENTICE_ROUNDS[idx]
+        domain = round_cfg["domain"]
 
-        if round_cfg["domain"] in completed_domains:
-            print(f"  Skipping {round_cfg['domain']} — already completed")
-            adapter_path = adapters_dir / f"{round_cfg['domain']}.safetensors"
-            if not adapter_path.exists() and args.resume:
-                adapter_path = Path(args.resume) / "adapters" / f"{round_cfg['domain']}.safetensors"
-            if adapter_path.exists():
-                all_adapter_weights[round_cfg['domain']] = load_adapter_weights(str(adapter_path))
+        # Check for existing adapter
+        adapter_path = adapters_dir / f"{domain}.safetensors"
+        if adapter_path.exists() and args.resume:
+            print(f"  Skipping {domain} — found existing adapter")
+            all_adapter_weights[domain] = load_adapter_weights(str(adapter_path))
             completed_round_entries.append(round_cfg)
             continue
 
-        log.phase("round", "start", domain=round_cfg["domain"],
-                  spec_steps=round_cfg["specialist_steps"],
-                  seq_len=round_cfg["seq_len"],
-                  latent_stage=round_cfg["latent_stage"])
-        print_hw(f"round {idx+1} start")
+        if args.distill_only:
+            print(f"  Skipping {domain} — distill-only mode")
+            continue
+
         result = run_round(
-            backbone=backbone,
-            domain=round_cfg["domain"],
+            backbone=model,
+            tokenizer=tokenizer,
+            domain=domain,
             data_path=round_cfg["file"],
             specialist_steps=round_cfg["specialist_steps"],
-            distill_steps=round_cfg["distill_steps"],
             save_dir=str(adapters_dir),
             seq_len=round_cfg["seq_len"],
-            latent_stage=round_cfg["latent_stage"],
             seq_len_schedule=round_cfg.get("seq_len_schedule"),
+            do_distill=not args.no_distill,
+            distill_steps=round_cfg.get("distill_steps", 50),
             existing_adapters=all_adapter_weights if all_adapter_weights else None,
         )
 
-        log.phase("round", "complete", domain=round_cfg["domain"],
-                  distill_loss=result.get("distill_loss", "N/A"))
-        print_hw(f"round {idx+1} end")
-        distill_loss = result.get("distill_loss", "N/A")
-        print(f"\n  Round {idx+1} ({round_cfg['domain']}) complete")
-        print(f"    Adapter: {result['adapter_path']}")
-        print(f"    Distill loss: {distill_loss if distill_loss is not None else 'N/A'}")
-
-        adapter_path = adapters_dir / f"{round_cfg['domain']}.safetensors"
+        adapter_path = adapters_dir / f"{domain}.safetensors"
         if adapter_path.exists():
-            all_adapter_weights[round_cfg['domain']] = load_adapter_weights(str(adapter_path))
+            all_adapter_weights[domain] = load_adapter_weights(str(adapter_path))
         completed_round_entries.append(round_cfg)
 
-    n_completed = len(all_adapter_weights)
-    if n_completed < 3:
-        print(f"\n  Skipping router training — only {n_completed} specialists exist (need >=3)")
-        log.phase("router", "skipped", n_completed=n_completed)
-    else:
-        log.phase("router", "start")
-        print_hw("router")
-        print(f"\n{'='*60}")
-        print(f"  Training Router ({n_completed} specialists)")
-        print(f"{'='*60}")
-        train_router(backbone, cfg, tok, save_dir)
-        log.phase("router", "complete")
+    # Distillation-only mode
+    if args.distill_only and all_adapter_weights:
+        combined = gather_combined_data(completed_round_entries)
+        reset_adapter(model)
+        print(f"\n  Running distillation-only on {len(all_adapter_weights)} specialists")
+        for idx in round_indices:
+            round_cfg = APPRENTICE_ROUNDS[idx]
+            if round_cfg["domain"] in all_adapter_weights:
+                distill_backbone(
+                    model, all_adapter_weights, combined, tokenizer,
+                    steps=round_cfg.get("distill_steps", 50),
+                    seq_len=min(round_cfg["seq_len"], 512),
+                )
+                break
 
-    export_backbone(backbone, save_dir)
+    # Router training (if enough specialists)
+    n_completed = len(all_adapter_weights)
+    if n_completed >= 3:
+        print(f"\n  Training router ({n_completed} specialists)...")
+        train_router(model, tokenizer, save_dir)
+    else:
+        print(f"\n  Skipping router — only {n_completed} specialists (need >=3)")
+
+    export_backbone(model, save_dir)
 
     total_elapsed = time.time() - t_start
-    log.summary("orchestrator", total_elapsed=total_elapsed,
-                rounds=args.rounds, completed=[r["domain"] for r in completed_round_entries])
-    print_hw("end")
     print(f"\n{'='*60}")
     print(f"  Training complete. All artifacts in {save_dir}")
     print(f"  Total wall time: {total_elapsed//60:.0f}m {total_elapsed%60:.0f}s")

@@ -657,11 +657,155 @@ HF datasets verified individually (tool_caller with glaive-fn + AgentInstruct pr
 - Adversarial rates and latent reasoning patterns are preserved
 - Output format (`domain`, `type`, `messages`) is identical — backward compatible with existing training pipeline
 
+## `[uncommitted]` — 2026-05-24
+
+**Qwen pivot implementation — all 9 prompts from instructs.md completed.**
+
+Executed the full pivot plan: deleted the old Mamba/Attention architecture, rewrote all training infrastructure for Qwen2.5-0.5B, and implemented the complete apprenticeship stack.
+
+### Files deleted (11 files)
+
+- `model/agent_lm.py` — AgentMind model class (replaced by `mlx_lm.load()`)
+- `model/mamba_block.py` — SSM architecture (deleted)
+- `model/attention_block.py` — Custom attention (deleted)
+- `model/mtp_head.py` — MTP heads (deleted — no MTP in Qwen arch)
+- `model/latent.py` — Latent token injection (deleted)
+- `model/hybrid_block.py` — Dead code (deleted)
+- `model/rope.py` — Custom RoPE (Qwen has its own)
+- `model/__init__.py` — Cleaned up with model/ deletion
+- `init.py` — Weight initialization (irrelevant for pretrained)
+- `tokenizer_setup.py` — Custom SentencePiece tokenizer (deleted)
+- `pretrain_backbone.py` — No more raw pretraining
+- `export.py` — Custom export format (replaced by export_apprentice.py)
+- `pretokenize.py` — Pre-tokenization format (no longer needed)
+
+### Prompt 3&4 — `lora.py` updated for Qwen targets
+
+- Default targets changed from `["in_proj", "out_proj", "o_proj", "q_proj", "v_proj", "lm_head"]` to `["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]`
+- Added `load_lora(model, adapter_weights: dict)` standalone function for fast in-memory adapter swapping (~9MB, <1ms on Apple Unified Memory)
+- Kept existing `save_adapter()`, `load_adapter()`, `reset_adapter()` — they work with any MLX model with LoRALinear layers
+- Smoke test passed: all 7 Qwen target modules wrapped, load_lora verified weight-equality
+
+### Prompt 2 — `router.py` rewritten for Qwen backbone
+
+- `d_model` default changed from 1024 to 512 (Qwen2.5-0.5B hidden size)
+- `train()` method now uses `tokenizer.apply_chat_template()` for sample formatting (replaces old `format_sample()` + SentencePiece)
+- Backbone hidden state extraction: `backbone.model(ids)` instead of `backbone.forward_with_state(ids, {})` + `backbone.last_hidden`
+- Removed imports from `training_utils.format_sample` and `stats_logger`
+- ~33K params classifier: Linear(512→64) → ReLU → Linear(64→5)
+- Smoke test: output shape (1, 5), fallback to "tool_caller" on uniform input confirmed
+
+### `config.py` rewritten for Qwen backbone
+
+- Added `backbone_id: str = "Qwen/Qwen2.5-0.5B"` to `AgentMindConfig`
+- `d_model: int = 512`, `vocab_size: int = 151_936` (Qwen2.5-0.5B sizes)
+- Removed all Mamba/Attention architecture params: `d_state`, `d_conv`, `expand`, `dt_rank`, `n_heads`, `attn_window`, `attn_every`, `ffn_mult`, `tie_embeddings`, `n_layers`
+- Removed `SpecialistConfig` class entirely
+- Removed `use_mtp`, `mtp_weight`, `mtp_start` from `TrainingConfig` and `DistillConfig`
+- Removed `latent_stage` from all 5 `APPRENTICE_ROUNDS` entries
+- Removed all properties: `d_inner`, `dt_rank_val`, `ffn_hidden`, `is_attn_layer`, `param_count_estimate`
+- Removed `import math`
+
+### Prompt 1 — `apprentice.py` (CognitiveApprentice for Qwen)
+
+- Wraps Qwen backbone with LoRA adapters on Qwen's target modules
+- `__init__`: calls `apply_lora()` with Qwen target modules, prints trainable param count
+- `save_adapter()` / `load_adapter()` / `reset_adapter()`: delegate to `lora.py`
+- `train()`: complete MLX training loop with `cross_entropy_loss`, gradient clipping, NaN recovery, tqdm progress
+- Returns LoRA A/B weights dict
+
+### `data/pipeline.py` rewritten with chat template
+
+- Removed all references to `model.latent`, `inject_latent_tokens`, `latent_stage`
+- Removed `from_pretokenized()` classmethod
+- `AgentDataset.__getitem__()` uses `tokenizer.apply_chat_template()` directly instead of old `format_sample()`
+- `make_labels()` masks non-assistant tokens based on Qwen's `<|im_start|>` / `<|im_end|>` markers
+- Cleaner: no `cfg` parameter needed, no `_cache` keyed by latent_stage
+
+### Prompt 5 — `train.py` refactored for Qwen (no MTP, no latent)
+
+- Removed imports from `model.agent_lm`, `model.mtp_head`, `model.latent`, `init`
+- `train_specialist()`: loads backbone from `mlx_lm.load()`, uses `tokenizer.apply_chat_template()`, no MTP/latent
+- `distill_backbone()`: no MTP loss (mtp_head.py doesn't exist), pure CE + KL
+- Removed `build_training_model()`, `load_training_data()`, `make_train_step()`, `_build_teacher_models()`
+- Removed all MTP, latent, prose contamination, syntax aux helpers (~400 lines of dead code)
+- Reduced from 952 to ~292 lines
+
+### Prompt 7 — `eval.py` updated with KV cache generation
+
+- Removed all references to `model.latent.latent_loss_mask`, `model.mtp_head`, `forward_with_state`, `h_states`
+- Generation now uses `generate_step` from `mlx_lm.utils` with KV cache
+- `evaluate_apprentice(model, tokenizer, adapter_weights, domain_dataset)` — uses `load_lora()` from lora module
+- `test_interference()` updated to pass `(model, tokenizer)` to test_fn
+
+### Prompt 6 — `training_orchestrator.py` rewritten
+
+- Backbone loaded via `mlx_lm.load("Qwen/Qwen2.5-0.5B")` — no AgentMind
+- Special tokens added via `tokenizer.add_tokens()` + `model.resize_vocab()`
+- No imports from `tokenizer_setup`, `model.agent_lm`, `init`, `training_utils._nested_weights`
+- Default is NO distillation (--no-distill flag, or --distill-only)
+- New CLI flags: `--no-distill`, `--distill-only`, `--train-router`
+- Router training: either automatic (≥3 specialists after rounds) or explicit (--train-router)
+
+### Prompt 8 — `agent.py` rewritten with KV cache generation
+
+- No imports from `config`, `model.agent_lm`, `init`, `tokenizer_setup`
+- KV cache via `generate_step()` (not `forward_with_state` + `h_states`)
+- Prompt building uses `tokenizer.apply_chat_template()` with Qwen message format
+- Two modes: `--adapter` (Phase A/B fixed) or `--adapters + --router` (Phase C routed)
+- Router import is lazy (inside `main()`) to avoid circular dependencies
+- All 3 tool implementations: `web_search`, `run_python`, `read_file`
+
+### Prompt 9 — `export_apprentice.py` written
+
+- Exports three artifacts: backbone weights, per-domain adapters, router with config
+- Copies backbone from safetensors or directory
+- Copies each domain's adapter from adapters directory
+- Exports router safetensors + `router_config.json` with domain names and fallback threshold
+- CLI: `--backbone`, `--adapters`, `--router`, `--out`, `--bits`
+
+### Integration tests
+
+```
+[imports] config.py OK
+[imports] pipeline.py OK
+[imports] lora.py OK
+[imports] router.py OK
+[imports] apprentice.py OK
+[imports] train.py OK
+[imports] eval.py OK
+[imports] training_orchestrator.py OK
+[imports] export_apprentice.py OK
+[imports] scheduler.py OK
+[imports] training_utils.py OK
+ALL 11 MODULES IMPORT OK
+```
+
+### Key design decisions
+
+1. **No MTP in new architecture** — MTP was only useful during distillation with the old architecture. Qwen already has strong next-token prediction. MTP head module is deleted entirely.
+2. **No latent reasoning in new architecture** — latent token injection and latent loss masking were specific to the old AgentMind's training curriculum. Qwen has Chain-of-Thought via its own chat template.
+3. **Distillation is opt-in** — the old orchestrator ran distillation after EVERY round. The new default is `--no-distill` (no distillation). Pass `--distill-only` or omit `--no-distill` to enable it.
+4. **chat_template replaces format_sample** — Qwen's `<|im_start|>/<|im_end|>` format is used via `tokenizer.apply_chat_template()`. Special tokens are added via `tokenizer.add_tokens()`.
+5. **Special tokens resolved at runtime** — no more hardcoded token IDs. `tokenizer.convert_tokens_to_ids()` is used everywhere.
+
+---
+
 ## Current State
 
 | Component | Status |
 |---|---|
-| Backbone (AgentMind-147M) | ✅ Built, 73 regression tests passing |
+| Backbone (Qwen2.5-0.5B) | ✅ Loaded via `mlx_lm.load()` |
+| LoRA (Qwen target modules) | ✅ 7 targets, save/load/reset/load_lora |
+| CognitiveApprentice | ✅ Written, trains on Qwen |
+| TaskRouter (d_model=512) | ✅ Rewritten, chat-template based |
+| training_orchestrator | ✅ Written, no MTP/latent, distill opt-in |
+| agent.py (two modes) | ✅ Written, KV cache generation |
+| eval.py (per-apprentice) | ✅ Written, KV cache based |
+| export_apprentice.py | ✅ Written |
+| config.py (Qwen config) | ✅ Rewritten |
+| data/pipeline.py (chat template) | ✅ Rewritten |
+| train.py (no MTP/latent) | ✅ Rewritten, ~292 lines |
 | MambaBlock (compiled sequential scan) | ✅ Exact parity verified |
 | LocalAttentionBlock (RoPE, window=256) | ✅ Working |
 | MTP heads (4 × aux prediction) | ✅ Built, wired for distillation |
@@ -1247,6 +1391,38 @@ Added three new capabilities to `train.py` for protocol-level visibility:
 ---
 
 ## `[uncommitted]` — 2026-05-24
+
+**Zero-loss bug fix, mx.compile 10x speedup, seq_len config review.**
+
+Two bugs and one optimization found during the first Qwen training run:
+
+### 1. `make_labels()` zero-loss bug (critical)
+
+`make_labels()` in both `data/pipeline.py` and `train.py` checked for `"<|im_start|>assistant"` as a single combined token ID. Qwen2.5 tokenizer splits this into `<|im_start|>` (151644) + `assistant` (77091). The combined-ID lookup returned `None`, so `in_assistant` was never set to `True`, and ALL labels were `-100` — zero loss, zero gradients.
+
+**Fix**: Detect assistant turn start via `ids[i] == im_start_id and ids[i+1] == assistant_id`. Verified: 94/128 tokens correctly labeled as trainable in a sample batch.
+
+### 2. `mx.compile` removes 10x overhead
+
+The inner training loop was redefining `loss_fn` as a closure each iteration, preventing MLX from caching the computation graph. Restructured to define `loss_fn(params, inp, tgt)` once outside the loop with explicit parameters, then wrapped with `mx.compile(loss_fn)`. Step time at seq=256: ~4s → **405ms**. 2000 steps drops from 2.2h → **13 min**.
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Step time (seq=256) | ~4s | ~405ms |
+| Throughput (grad_accum=8) | ~500 tok/s | ~5000 tok/s |
+| 2000 steps | ~2.2h | ~13 min |
+
+### 3. Sequence length review (not yet applied)
+
+Current config uses `{0: 384, 200: 512}` for tool_caller — unnecessarily long for short JSON tool call patterns. Attention cost is O(L²), so 512 is 16x more expensive than 128. Recommended: `{0: 128, 200: 256}` for 90% of tool_caller training, reserve 512 for final polish.
+
+### 4. Other fixes
+
+- **Timing formula**: Fixed tok/s calculation to multiply by `steps_since_last_log` (was dividing 100 steps' time by 1 step's tokens)
+- **Debug output**: Added last-token prediction decode every 500 steps
+- **`d_model=896`** corrected in router.py docs and AGENTS.md (Qwen2.5-0.5B actual hidden size, not 512)
+- **`tokenizer._tokenizer.add_tokens()`** documented: `TokenizerWrapper` lacks `add_tokens()`, must access the underlying HF tokenizer
+- **Embedding NOT resized**: 151936 slots have room for 10 new tokens; MLX `Model` lacks `resize_vocab()`
 
 **Pivot: abandoning raw pretraining, adopting Qwen2.5-0.5B backbone. Here's why.**
 

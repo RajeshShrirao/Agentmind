@@ -1,11 +1,47 @@
+"""eval.py — Evaluation for Qwen2.5-based AgentMind.
+
+Per-apprentice evaluation + cross-apprentice interference detection.
+Uses KV cache generation (not old SSM forward_with_state).
+"""
+
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.generate import generate_step
 import json
+from pathlib import Path
+
 from data.pipeline import make_dataloader
-from decode import generate_tool_call, validate_tool_call, tool_eval_report, print_tool_report, extract_tool_calls, TOOL_REGISTRY
+from lora import load_lora
+from training_utils import cross_entropy_loss
+from decode import extract_tool_calls
 
 
-def compute_loss(model, dataset, tok, cfg, max_batches: int = 50, max_len: int = 512) -> float:
+def _greedy_sampler(logits):
+    return mx.argmax(logits, axis=-1)
+
+
+def _sampler(temp=0.0):
+    if temp <= 0.0:
+        return _greedy_sampler
+    def _temp_sampler(logits):
+        return mx.random.categorical(mx.log(mx.softmax(logits / temp) + 1e-10))
+    return _temp_sampler
+
+
+def _generate_text(model, tokenizer, prompt_tokens, max_tokens=200, temp=0.0):
+    sampler = _sampler(temp)
+    output_ids = []
+    eos_ids = getattr(tokenizer, 'eos_token_ids', None)
+    if eos_ids is None:
+        eos_ids = {tokenizer.eos_token_id}
+    for tok_id, _ in generate_step(prompt_tokens, model, max_tokens=max_tokens, sampler=sampler):
+        if tok_id in eos_ids:
+            break
+        output_ids.append(tok_id)
+    return tokenizer.decode(output_ids)
+
+
+def compute_loss(model, dataset, tokenizer, max_batches=50, max_len=512):
     """Average cross-entropy loss on validation set."""
     total_loss = 0.0
     total_tokens = 0
@@ -16,21 +52,14 @@ def compute_loss(model, dataset, tok, cfg, max_batches: int = 50, max_len: int =
         if i >= max_batches:
             break
 
-        from model.latent import latent_loss_mask
-        stage = getattr(dataset, "latent_stage", 1)
-        if stage >= 3:
-            masked_targets = latent_loss_mask(input_ids, targets, cfg.think_start_id, cfg.think_end_id)
-        else:
-            masked_targets = targets
+        logits = model(input_ids)
 
-        logits, _ = model(input_ids)
+        logits_slice = logits[:, :-1, :]
+        targets_slice = targets[:, 1:]
 
-        logits = logits[:, :-1, :]
-        masked_targets = masked_targets[:, 1:]
-
-        B, L, V = logits.shape
-        flat_logits  = logits.reshape(-1, V)
-        flat_targets = masked_targets.reshape(-1)
+        B, L, V = logits_slice.shape
+        flat_logits = logits_slice.reshape(-1, V)
+        flat_targets = targets_slice.reshape(-1)
 
         mask = (flat_targets != -100).astype(mx.float32)
         safe_targets = mx.where(flat_targets == -100, 0, flat_targets)
@@ -44,39 +73,16 @@ def compute_loss(model, dataset, tok, cfg, max_batches: int = 50, max_len: int =
     return total_loss / total_tokens
 
 
-def evaluate_tool_calls(model, prompts: list[str], tok, cfg) -> list[dict]:
-    """
-    Evaluate tool call generation using structured decoding.
-    Each prompt is fed to the model via greedy decode.
-    Returns per-call result dicts from decode.py validation.
+def evaluate_tool_calls(model, tokenizer, prompts, max_tokens=200, temp=0.0):
+    """Evaluate tool call generation using KV cache generation.
+
+    Uses generate_step() with persistent KV cache.
+    Returns list of {raw, valid, name, args, error, failure_mode} dicts.
     """
     results = []
     for prompt in prompts:
-        ids = mx.array([tok.encode(prompt, add_bos=True)])
-        result = generate_tool_call(model, ids, {}, cfg, tok)
-        results.append(result)
-    return results
-
-
-def evaluate_tool_calls_from_text(model, prompts: list[str], tok, cfg) -> list[dict]:
-    """
-    Legacy-style: generate freeform text, then extract and validate tool calls.
-    Maintains SSM state via forward_with_state for O(L) not O(L²).
-    Uses argmax (no temperature).
-    """
-    results = []
-    for prompt in prompts:
-        ids = mx.array([tok.encode(prompt, add_bos=True)])
-        h_states = {}
-        output_ids = []
-        for _ in range(200):
-            logits, h_states = model.forward_with_state(ids, h_states)
-            next_tok = mx.argmax(logits[0, -1]).item()
-            output_ids.append(next_tok)
-            ids = mx.array([[next_tok]])
-            if next_tok == cfg.eos_id:
-                break
-        decoded = tok.decode(output_ids)
+        tokens = tokenizer.encode(prompt)
+        decoded = _generate_text(model, tokenizer, mx.array(tokens), max_tokens=max_tokens, temp=temp)
         call_results = extract_tool_calls(decoded)
         if call_results:
             results.extend(call_results)
@@ -86,25 +92,25 @@ def evaluate_tool_calls_from_text(model, prompts: list[str], tok, cfg) -> list[d
     return results
 
 
-def format_adherence(model, prompts: list[str], tok, cfg) -> dict:
-    """Check structural output quality with greedy decoding. Maintains SSM state."""
+def format_adherence(model, tokenizer, prompts) -> dict:
+    """Check structural output quality with greedy decoding."""
     results = {"plan": 0, "scratch": 0, "eos": 0, "total": len(prompts)}
+    eos_ids = getattr(tokenizer, 'eos_token_ids', None)
+    if eos_ids is None:
+        eos_ids = {tokenizer.eos_token_id}
 
     for prompt in prompts:
-        ids = mx.array([tok.encode(prompt, add_bos=True)])
-        h_states = {}
-        output_ids = []
+        tokens = tokenizer.encode(prompt)
+        prompt_arr = mx.array(tokens)
 
-        for _ in range(300):
-            logits, h_states = model.forward_with_state(ids, h_states)
-            next_tok = mx.argmax(logits[0, -1]).item()
-            output_ids.append(next_tok)
-            ids = mx.array([[next_tok]])
-            if next_tok == cfg.eos_id:
+        output_ids = []
+        for tok_id, _ in generate_step(prompt_arr, model, max_tokens=300, sampler=_greedy_sampler):
+            if tok_id in eos_ids:
                 results["eos"] += 1
                 break
+            output_ids.append(tok_id)
 
-        decoded = tok.decode(output_ids)
+        decoded = tokenizer.decode(output_ids)
         if "<|plan|>" in decoded:
             results["plan"] += 1
         if "<|scratch|>" in decoded:
@@ -113,33 +119,8 @@ def format_adherence(model, prompts: list[str], tok, cfg) -> dict:
     return results
 
 
-def evaluate(model, val_dataset, tok, cfg, max_len: int = 512):
-    """Combined eval — returns (val_loss, tool_report)."""
-    try:
-        val_loss = compute_loss(model, val_dataset, tok, cfg, max_batches=10, max_len=max_len)
-    except Exception:
-        val_loss = 100.0
-
-    test_prompts = [
-        "<|user|>Search arxiv for Mamba SSM papers<|assistant|>",
-        "<|user|>Get the weather in Tokyo and Pune<|assistant|>",
-        "<|user|>Run the test suite and fix any failures<|assistant|>",
-    ]
-    try:
-        call_results = evaluate_tool_calls(model, test_prompts, tok, cfg)
-        tool_report = tool_eval_report(call_results)
-        if tool_report["total"] > 0:
-            print_tool_report(tool_report)
-    except Exception:
-        tool_report = {"total": 0, "valid": 0, "valid_pct": 0.0,
-                       "breakdown": {"eval_error": 1}, "tool_counts": {}}
-
-    return val_loss, tool_report
-
-
 def evaluate_tool_syntax(text: str) -> dict:
-    """
-    Lightweight tool-call syntax metric.
+    """Lightweight tool-call syntax metric.
 
     Extracts all tool calls from generated text and checks:
       - parse_success: extracts as valid JSON
@@ -189,15 +170,7 @@ def evaluate_tool_syntax(text: str) -> dict:
     return result
 
 
-def tool_call_accuracy(model, prompts: list[str], tok, cfg) -> float:
-    """Legacy: kept for backward compat. Returns fraction of prompts with valid JSON."""
-    results = evaluate_tool_calls(model, prompts, tok, cfg)
-    if not results:
-        return 0.0
-    return sum(1 for r in results if r.get("valid")) / max(len(results), 1)
-
-
-def _extract_eval_prompts(domain_dataset, tok, max_tokens: int = 512,
+def _extract_eval_prompts(domain_dataset, tokenizer, max_tokens: int = 512,
                           fallback_prompts: list[str] = None) -> list[str]:
     """Build evaluation prompts from domain dataset samples, truncated to max_tokens."""
     prompts = []
@@ -214,8 +187,8 @@ def _extract_eval_prompts(domain_dataset, tok, max_tokens: int = 512,
                 elif role == "assistant":
                     text += f"<|assistant|>{content}<eos>"
             if text:
-                ids = tok.encode(text, add_bos=True)[:max_tokens]
-                prompts.append(tok.decode(ids))
+                ids = tokenizer.encode(text, add_special_tokens=False)[:max_tokens]
+                prompts.append(tokenizer.decode(ids))
     if not prompts:
         prompts = fallback_prompts or [
             "<|user|>Search arxiv for Mamba SSM papers<|assistant|>",
@@ -225,9 +198,8 @@ def _extract_eval_prompts(domain_dataset, tok, max_tokens: int = 512,
     return prompts
 
 
-def evaluate_apprentice(model, adapter_weights: dict, domain_dataset, tok, cfg) -> dict:
-    """
-    Run all metrics for one specialist.
+def evaluate_apprentice(model, tokenizer, adapter_weights, domain_dataset) -> dict:
+    """Run all metrics for one specialist.
 
     Loads the adapter into the backbone, computes:
       - Loss on held-out domain data
@@ -240,14 +212,14 @@ def evaluate_apprentice(model, adapter_weights: dict, domain_dataset, tok, cfg) 
 
     orig = dict(tree_flatten(model.trainable_parameters()))
 
-    model.load_lora(adapter_weights)
+    load_lora(model, adapter_weights)
 
-    loss = compute_loss(model, domain_dataset, tok, cfg, max_batches=20, max_len=512)
+    loss = compute_loss(model, domain_dataset, tokenizer, max_batches=20, max_len=512)
 
-    prompts = _extract_eval_prompts(domain_dataset, tok)
+    prompts = _extract_eval_prompts(domain_dataset, tokenizer)
 
     try:
-        call_results = evaluate_tool_calls(model, prompts, tok, cfg)
+        call_results = evaluate_tool_calls(model, tokenizer, prompts)
         valid = sum(1 for r in call_results if r.get("valid"))
         tool_acc = valid / max(len(call_results), 1)
     except Exception as e:
@@ -255,20 +227,19 @@ def evaluate_apprentice(model, adapter_weights: dict, domain_dataset, tok, cfg) 
         tool_acc = 0.0
 
     try:
-        fmt = format_adherence(model, prompts, tok, cfg)
+        fmt = format_adherence(model, tokenizer, prompts)
     except Exception as e:
         print(f"  [evaluate_apprentice] format eval skipped: {e}")
         fmt = {"plan": 0, "scratch": 0, "eos": 0, "total": len(prompts)}
 
     if orig:
-        model.load_lora(orig)
+        load_lora(model, orig)
 
     return {"loss": loss, "tool_acc": tool_acc, "format": fmt}
 
 
-def test_interference(model, adapters: dict, test_fn, tok, cfg) -> tuple:
-    """
-    Measure cross-apprentice interference.
+def test_interference(model, adapters: dict, test_fn, tokenizer) -> tuple:
+    """Measure cross-apprentice interference.
 
     For each specialist (A):
       Load adapter A, run test_fn, record baseline_A
@@ -286,21 +257,26 @@ def test_interference(model, adapters: dict, test_fn, tok, cfg) -> tuple:
     baselines = {}
 
     for name, adapter in adapters.items():
-        model.load_lora(adapter)
-        baselines[name] = test_fn(model, tok, cfg)
+        load_lora(model, adapter)
+        baselines[name] = test_fn(model, tokenizer)
 
     interference = {}
     for name_a, adapter_a in adapters.items():
         for name_b, adapter_b in adapters.items():
             if name_a == name_b:
                 continue
-            model.load_lora(adapter_a)
-            score = test_fn(model, tok, cfg)
+            load_lora(model, adapter_a)
+            score = test_fn(model, tokenizer)
             diff = score - baselines[name_a]
             interference[f"{name_a}_under_{name_b}"] = diff
             if abs(diff) > 0.05:
-                print(f"  ⚠️  SPECIALIST INTERFERENCE DETECTED: "
+                print(f"  SPECIALIST INTERFERENCE DETECTED: "
                       f"{name_a} under {name_b}: {diff:+.4f} "
                       f"(baseline={baselines[name_a]:.4f}, actual={score:.4f})")
 
     return baselines, interference
+
+
+def evaluate_apprentice_legacy(model, tokenizer, adapter_weights, domain_dataset) -> dict:
+    """Legacy entry point kept for backward compat."""
+    return evaluate_apprentice(model, tokenizer, adapter_weights, domain_dataset)

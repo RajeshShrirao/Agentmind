@@ -1,102 +1,128 @@
-import copy
-import json
-import random
+"""
+data/pipeline.py — Data loading and batching for Qwen2.5-based AgentMind.
+
+The backbone's tokenizer (Qwen's AutoTokenizer) handles formatting via
+apply_chat_template(). Special tokens (<|tool_call|>, <|observe|>, etc.)
+are added as user_defined_symbols and are preserved by the BPE tokenizer.
+"""
+
+import json, random
 import mlx.core as mx
 import numpy as np
 from typing import Iterator
 
-from training_utils import format_sample
+
+def make_labels(ids: list[int], tokenizer) -> list[int]:
+    labels = [-100] * len(ids)
+    in_assistant = False
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    assistant_id = tokenizer.convert_tokens_to_ids("assistant")
+
+    for i, tok_id in enumerate(ids):
+        if tok_id == im_start_id and i + 1 < len(ids) and ids[i + 1] == assistant_id:
+            in_assistant = True
+        if in_assistant:
+            labels[i] = tok_id
+        if tok_id == im_end_id:
+            in_assistant = False
+    return labels
 
 
 class AgentDataset:
-    def __init__(self, samples=None, cfg=None, tokenizer=None):
+    def __init__(self, samples=None, tokenizer=None):
         self.samples = samples or []
-        self.cfg = cfg
-        self.tok = tokenizer
-        self.ids_array = None
-        self.labels_array = None
-        self.latent_stage = 1
+        self.tokenizer = tokenizer
         self._cache = {}
-        self.weights = {
-            "instruction": 0.30,
-            "tool_single": 0.30,
-            "agent_multi": 0.25,
-            "recovery": 0.15,
-        }
+        self._tokenized_samples = None
 
     @classmethod
-    def from_raw(cls, paths, tokenizer, cfg):
+    def from_raw(cls, path, tokenizer, pretokenize: bool = True):
+        """Load samples from a JSONL file."""
         samples = []
-        for path in paths:
-            with open(path) as f:
+        if isinstance(path, str):
+            paths = [path]
+        else:
+            paths = path
+        for p in paths:
+            with open(p) as f:
                 for line in f:
                     samples.append(json.loads(line.strip()))
-        return cls(samples=samples, cfg=cfg, tokenizer=tokenizer)
+        ds = cls(samples=samples, tokenizer=tokenizer)
+        return ds.pretokenize() if pretokenize else ds
 
-    @classmethod
-    def from_pretokenized(cls, ids_path, labels_path):
-        ds = cls()
-        ds.ids_array = mx.array(np.load(ids_path)["arr_0"])
-        ds.labels_array = mx.array(np.load(labels_path)["arr_0"])
-        return ds
+    def pretokenize(self):
+        """Materialize tokenized samples once so training does not tokenize lazily."""
+        if self._tokenized_samples is not None:
+            return self
+        if self.tokenizer is None:
+            raise ValueError("Cannot pretokenize without a tokenizer")
+
+        tokenized = []
+        for sample in self.samples:
+            if isinstance(sample, dict) and "ids" in sample and "labels" in sample:
+                ids = sample["ids"]
+                labels = sample["labels"]
+            else:
+                messages = sample["messages"]
+                text = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+                ids = self.tokenizer.encode(text)
+                labels = make_labels(ids, self.tokenizer)
+            tokenized.append((ids, labels))
+
+        self._tokenized_samples = tokenized
+        self._cache = {i: sample for i, sample in enumerate(tokenized)}
+        return self
 
     def train_val_split(self, ratio=0.95, shuffle=True):
-        if self.ids_array is not None:
-            n = len(self.ids_array)
-            split_idx = int(n * ratio)
-            train = AgentDataset()
-            train.ids_array = self.ids_array[:split_idx]
-            train.labels_array = self.labels_array[:split_idx]
-            train.cfg = self.cfg
-            train.tok = self.tok
-            val = AgentDataset()
-            val.ids_array = self.ids_array[split_idx:]
-            val.labels_array = self.labels_array[split_idx:]
-            val.cfg = self.cfg
-            val.tok = self.tok
-            return train, val
+        indices = list(range(len(self.samples)))
         if shuffle:
-            random.shuffle(self.samples)
-        split_idx = int(len(self.samples) * ratio)
+            random.shuffle(indices)
+        split_idx = int(len(indices) * ratio)
+        train_idx = indices[:split_idx]
+        val_idx = indices[split_idx:]
+
         train = AgentDataset(
-            samples=self.samples[:split_idx], cfg=self.cfg, tokenizer=self.tok
+            samples=[self.samples[i] for i in train_idx],
+            tokenizer=self.tokenizer,
         )
         val = AgentDataset(
-            samples=self.samples[split_idx:], cfg=self.cfg, tokenizer=self.tok
+            samples=[self.samples[i] for i in val_idx],
+            tokenizer=self.tokenizer,
         )
+        if self._tokenized_samples is not None:
+            train._tokenized_samples = [self._tokenized_samples[i] for i in train_idx]
+            val._tokenized_samples = [self._tokenized_samples[i] for i in val_idx]
+            train._cache = {i: sample for i, sample in enumerate(train._tokenized_samples)}
+            val._cache = {i: sample for i, sample in enumerate(val._tokenized_samples)}
         return train, val
 
     def __len__(self):
-        if self.ids_array is not None:
-            return len(self.ids_array)
         return len(self.samples)
 
     def __getitem__(self, idx):
-        if self.ids_array is not None:
-            ids = self.ids_array[idx].tolist()
-            labels = self.labels_array[idx].tolist()
-            return ids, labels
+        if self._tokenized_samples is not None:
+            return self._tokenized_samples[idx]
+        if idx in self._cache:
+            return self._cache[idx]
 
-        cache_key = (idx, self.latent_stage)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        sample = self.samples[idx]
+        messages = sample["messages"]
 
-        from model.latent import inject_latent_tokens
+        # Apply chat template
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
 
-        sample = copy.deepcopy(self.samples[idx])
-        sample = inject_latent_tokens(sample, self.tok, self.latent_stage)
-        text = format_sample(sample)
-        ids = self.tok.encode(text, add_bos=True)
+        # Tokenize
+        ids = self.tokenizer.encode(text)
+        labels = make_labels(ids, self.tokenizer)
 
-        ids = ids[:self.cfg.max_seq_len]
-        labels = self._make_labels(ids, sample)[:self.cfg.max_seq_len]
-
-        self._cache[cache_key] = (ids, labels)
-        return ids, labels
-
-    def _make_labels(self, ids: list[int], sample: dict) -> list[int]:
-        from training_utils import make_labels
-        return make_labels(ids, self.cfg)
+        result = (ids, labels)
+        self._cache[idx] = result
+        return result
 
     def clear_cache(self):
         self._cache.clear()

@@ -1,29 +1,27 @@
-"""
-AgentMind AgentLoop — Router dispatch, adapter swapping, SSM state persistence.
+"""agent.py — AgentLoop for Qwen2.5-based AgentMind.
 
-Usage:
-  python agent.py --backbone ./checkpoints/backbone --adapters ./checkpoints/adapters \\
-      --router ./checkpoints/router --query "Search arxiv for SSM papers"
+Two modes:
+  Phase A/B (manual adapter):
+    python agent.py --backbone Qwen/Qwen2.5-0.5B --adapter ./tool_caller.safetensors --query "..."
+
+  Phase C (router dispatch):
+    python agent.py --backbone Qwen/Qwen2.5-0.5B --adapters ./adapters --router ./router --query "..."
 """
 
 import json, os, subprocess, argparse, urllib.request, urllib.parse
 from pathlib import Path
 
 import mlx.core as mx
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx_lm import load as load_model
+from mlx_lm.models.cache import make_prompt_cache
 
-from config import AgentMindConfig
-from model.agent_lm import AgentMind
-from lora import apply_lora
-from init import init_agentmind
-from router import TaskRouter
-from tokenizer_setup import load_tokenizer, get_token_ids, hydrate_config
+from lora import apply_lora, load_lora
+
 
 SYSTEM_PROMPT = """You are an AI assistant with access to tools. Follow this protocol:
-1. Think step by step if needed using <|think_start|>...<|think_end|>
-2. To use a tool, emit: <|tool_call|>{"name": "tool_name", "args": {...}}
-3. The tool result will follow as: <|observe|>{"result": ...}
-4. Continue the conversation naturally after observing the result
+1. To use a tool, emit: <|tool_call|>{"name": "tool_name", "args": {...}}
+2. The tool result will follow as: <|observe|>{"result": ...}
+3. Continue the conversation naturally after observing the result
 
 Available tools:
 - web_search(query: str): Search the web for current information
@@ -45,10 +43,7 @@ def _top_p_sampling(logits, temp=0.7, top_p=0.9):
     return mx.random.categorical(mx.log(probs + 1e-10)).item()
 
 
-# ── Tool implementations ────────────────────────────────
-
 def _web_search(query: str) -> dict:
-    """Search the web via DuckDuckGo lite HTML API."""
     try:
         url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -64,7 +59,6 @@ def _web_search(query: str) -> dict:
 
 
 def _run_python(code: str) -> dict:
-    """Execute Python code with a 10-second timeout."""
     try:
         proc = subprocess.run(
             ["python3", "-c", code],
@@ -82,7 +76,6 @@ def _run_python(code: str) -> dict:
 
 
 def _read_file(path: str) -> dict:
-    """Read a file from disk (max 10KB)."""
     try:
         p = Path(path).expanduser().resolve()
         if not p.exists():
@@ -106,31 +99,59 @@ DEFAULT_TOOLS = {
 TOOL_CALL_BOUNDARY_TOKENS = {"<|observe|>", "<|end|>", "<eos>"}
 
 
-# ── AgentLoop ────────────────────────────────────────────
-
 class AgentLoop:
-    def __init__(self, backbone, router, adapters: dict, tok, tools: dict, cfg):
-        self.backbone = backbone
-        self.router = router
-        self.adapters = adapters
-        self.tok = tok
-        self.tools = tools
-        self.cfg = cfg
-        self.h_states = {}
-        self.active_adapter = None
+    def __init__(self, model, tokenizer, adapter_path=None, adapters_dir=None, router=None, tools=None):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.tools = tools or DEFAULT_TOOLS
+        self.prompt_cache = make_prompt_cache(model)
+        self.eos_token_id = tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else None
+
+        if adapter_path:
+            self.fixed_adapter = self._load_adapter_weights(adapter_path)
+            load_lora(model, self.fixed_adapter)
+            self.adapter_mode = "fixed"
+            self.router = None
+            self.adapters = None
+            self.active_adapter = "fixed"
+            print(f"  Agent mode: fixed adapter ({adapter_path})")
+        elif adapters_dir and router:
+            self.adapters = self._load_all_adapters(adapters_dir)
+            self.router = router
+            self.adapter_mode = "routed"
+            self.active_adapter = None
+            print(f"  Agent mode: routed ({len(self.adapters)} adapters)")
+        else:
+            raise ValueError("Provide --adapter (fixed) or --adapters + --router (routed)")
+
+    def _load_adapter_weights(self, path):
+        loaded = mx.load(str(path))
+        if "metadata" in loaded:
+            del loaded["metadata"]
+        return loaded
+
+    def _load_all_adapters(self, adapters_dir):
+        adapters_dir = Path(adapters_dir)
+        adapters = {}
+        for f in sorted(adapters_dir.glob("*.safetensors")):
+            name = f.stem
+            loaded = mx.load(str(f))
+            if "metadata" in loaded:
+                del loaded["metadata"]
+            adapters[name] = loaded
+            print(f"  Loaded adapter: {name} ({sum(v.nbytes for v in loaded.values()) // 1024} KB)")
+        return adapters
 
     def _select_specialist(self, hidden_state):
-        logits = self.router(hidden_state[:, -1:, :])
-        return self.router.select_expert(hidden_state[:, -1:, :], threshold=0.6)
+        return self.router.select_expert(hidden_state, threshold=0.6)
 
     def _load_adapter(self, name):
         if self.active_adapter != name:
             if name in self.adapters:
-                self.backbone.load_lora(self.adapters[name])
-            self.active_adapter = name
+                load_lora(self.model, self.adapters[name])
+                self.active_adapter = name
 
-    def _handle_tool_call(self, text: str):
-        """Parse and execute a tool call embedded in generated text."""
+    def _handle_tool_call(self, text):
         idx = text.find("<|tool_call|>")
         if idx == -1:
             return None
@@ -155,111 +176,106 @@ class AgentLoop:
                 return {"error": str(e), "tool": name, "args": args}
         return {"error": f"unknown tool: {name}"}
 
+    def _forward(self, input_ids):
+        return self.model(input_ids, cache=self.prompt_cache)
+
     def run(self, user_query, max_tokens=200, temp=0.7, top_p=0.9):
-        prompt = f"<|system|>{SYSTEM_PROMPT}<|user|>{user_query}<|assistant|>"
-        ids = mx.array([self.tok.encode(prompt)])
-
-        logits, self.h_states = self.backbone.forward_with_state(ids, self.h_states)
-        if hasattr(self.backbone, "last_hidden") and self.backbone.last_hidden is not None:
-            specialist = self._select_specialist(self.backbone.last_hidden)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_query},
+        ]
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True
+        )
+        if isinstance(prompt, list):
+            ids = mx.array([prompt])
         else:
-            specialist = "tool_caller"
-        self._load_adapter(specialist)
+            ids = mx.array([prompt])
 
-        output_ids = []
+        if self.adapter_mode == "routed" and self.router is not None:
+            hidden = self.model.model(ids, cache=self.prompt_cache)
+            specialist = self._select_specialist(hidden)
+            self._load_adapter(specialist)
+            print(f"  Router selected: {specialist}")
+
         output_text = ""
         tool_call_emitted = False
         gen_pos = 0
 
+        logits = self._forward(ids)
+
         while gen_pos < max_tokens:
-            logits, self.h_states = self.backbone.forward_with_state(ids, self.h_states)
-            token = _top_p_sampling(logits[0, -1], temp=temp, top_p=top_p)
-            output_ids.append(token)
+            logits_last = logits[:, -1, :]
+            token = _top_p_sampling(logits_last, temp=temp, top_p=top_p)
             gen_pos += 1
 
-            decoded = self.tok.decode([token])
+            decoded = self.tokenizer.decode([token])
             output_text += decoded
-            ids = mx.array([[token]])
 
-            if token == self.cfg.tool_call_id:
+            if token == self.eos_token_id:
+                break
+
+            if "<|tool_call|>" in decoded:
                 tool_call_emitted = True
+                logits = self._forward(mx.array([[token]]))
                 continue
 
             if tool_call_emitted:
-                if token in (self.cfg.observe_id, self.cfg.eos_id):
+                if "<|observe|>" in decoded or "<|end|>" in decoded or "<eos>" in decoded:
                     result = self._handle_tool_call(output_text)
                     if result is not None:
                         observe_text = f"<|observe|>{json.dumps(result)}"
                         output_text += observe_text
-                        ids = mx.array([self.tok.encode(observe_text)])
-                        self.backbone.forward_with_state(ids, self.h_states)
-                        ids = mx.array([[self.cfg.eos_id]])
+                        observe_ids = self.tokenizer.encode(observe_text)
+                        for tid in observe_ids:
+                            logits = self._forward(mx.array([[tid]]))
                     tool_call_emitted = False
                     continue
+                logits = self._forward(mx.array([[token]]))
                 continue
 
-            if token == self.cfg.eos_id:
-                break
+            logits = self._forward(mx.array([[token]]))
 
         return output_text
 
 
-# ── CLI ────────────────────────────────────────────────────
-
-def load_adapters(adapters_dir: str) -> dict:
-    adapters_dir = Path(adapters_dir)
-    adapters = {}
-    for f in sorted(adapters_dir.glob("*.safetensors")):
-        name = f.stem
-        loaded = mx.load(str(f))
-        if "metadata" in loaded:
-            del loaded["metadata"]
-        adapters[name] = loaded
-        print(f"  Loaded adapter: {name} ({sum(v.nbytes for v in loaded.values()) // 1024} KB)")
-    return adapters
-
-
 def main():
     parser = argparse.ArgumentParser(description="AgentMind Agent Loop")
-    parser.add_argument("--backbone", type=str, default="./checkpoints",
-                        help="Path to backbone .safetensors or directory containing backbone.safetensors")
-    parser.add_argument("--adapters", type=str, default="./checkpoints/adapters",
-                        help="Directory containing specialist adapter .safetensors files")
-    parser.add_argument("--router", type=str, default="./checkpoints/router",
-                        help="Path to router .safetensors (or dir with router.safetensors)")
+    parser.add_argument("--backbone", type=str, default="Qwen/Qwen2.5-0.5B",
+                        help="HuggingFace model ID or path")
+    parser.add_argument("--adapter", type=str, default=None,
+                        help="Path to a single adapter .safetensors (Phase A/B)")
+    parser.add_argument("--adapters", type=str, default=None,
+                        help="Directory containing adapter .safetensors files (Phase C)")
+    parser.add_argument("--router", type=str, default=None,
+                        help="Path to router .safetensors (Phase C)")
     parser.add_argument("--query", type=str, default=None,
                         help="Single query to run (omit for interactive mode)")
     args = parser.parse_args()
 
-    cfg = AgentMindConfig()
+    print(f"Loading backbone: {args.backbone}")
+    model, tokenizer = load_model(args.backbone)
 
-    tok = load_tokenizer("agentmind_tok.model")
-    ids = get_token_ids(tok)
-    hydrate_config(cfg, tok)
-    print("Token IDs hydrated.")
+    special_tokens = [
+        "<|tool_call|>", "<|plan|>", "<|memory|>", "<|scratch|>", "<|observe|>",
+        "<|think_start|>", "<|think_end|>", "<|system|>", "<|user|>", "<|assistant|>",
+    ]
+    tokenizer._tokenizer.add_tokens(special_tokens)
+    # Embedding (151936 slots) already has room for these tokens
 
-    backbone = AgentMind(cfg)
-    backbone = init_agentmind(backbone, cfg)
-    apply_lora(backbone)
+    model = apply_lora(model)
 
-    backbone_path = Path(args.backbone)
-    if backbone_path.is_dir():
-        backbone_path = backbone_path / "backbone.safetensors"
-    if backbone_path.exists():
-        weights = mx.load(str(backbone_path))
-        backbone.update(tree_unflatten(dict(weights)))
-        print(f"Backbone loaded from {backbone_path}")
-    else:
-        print(f"Warning: backbone not found at {backbone_path}, using random init")
+    router = None
+    if args.router:
+        from router import TaskRouter
+        router = TaskRouter.load(str(args.router))
 
-    adapters = load_adapters(args.adapters)
-
-    router_path = Path(args.router)
-    if router_path.is_dir():
-        router_path = router_path / "router.safetensors"
-    router = TaskRouter.load(str(router_path))
-
-    agent = AgentLoop(backbone, router, adapters, tok, DEFAULT_TOOLS, cfg)
+    agent = AgentLoop(
+        model, tokenizer,
+        adapter_path=args.adapter,
+        adapters_dir=args.adapters,
+        router=router,
+    )
 
     if args.query:
         print(f"\nUser: {args.query}\n")

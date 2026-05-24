@@ -35,7 +35,7 @@ frozen teachers ──→ KL distillation ──→ backbone absorbs all domains
                      Router (65K params) selects specialist at inference
 ```
 
-Backbone loaded via `mlx_lm.load()`. Special tokens (`<|tool_call|>`, `<|observe|>`, etc.) added via `tokenizer.add_tokens()`. Embedding resized automatically.
+Backbone loaded via `mlx_lm.load()`. Special tokens added via `tokenizer._tokenizer.add_tokens()` (TokenizerWrapper lacks `add_tokens()`). Embedding NOT resized — 151936 slots have room for 10 special tokens (~151665-151674). MLX `Model` lacks `resize_vocab()`.
 
 ## Round schedule (`config.py` `APPRENTICE_ROUNDS`)
 
@@ -53,13 +53,13 @@ Router only trains after ≥3 specialists exist.
 
 1. **Data subset per epoch** — Dataloader samples 5K indices per epoch (not full dataset). Prevents the 1%-coverage bug that killed pretraining. Set in `train_specialist()` line 697.
 
-2. **Loss masks all tokens except assistant turns.** Labels for user/system are set to -100. Uses Qwen's chat template to identify assistant spans.
+2. **Loss masks all tokens except assistant turns.** Labels for user/system are set to -100. Uses Qwen's chat template to identify assistant spans. **Critical**: `<|im_start|>assistant` is two tokens (151644 + 77091), not one. `make_labels()` must check `ids[i] == im_start_id and ids[i+1] == assistant_id` — the old combined-token check returns `None` (all -100 labels, zero loss).
 
 3. **Latent reasoning stages**: Stage 1 (normal), Stage 2 (wrap CoT in think boundaries), Stage 3 (50% latent), Stage 4 (full latent). `latent_loss_mask()` zeros loss between `<|think_start|>` and `<|think_end|>`.
 
 4. **LoRA targets** differ from old AgentMind: `["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]`. Not `in_proj`/`out_proj` — those are Mamba-specific.
 
-5. **Special tokens added via `add_tokens()`** — not at fixed IDs. Always resolve at runtime via `tokenizer.convert_tokens_to_ids()`.
+5. **Special tokens added via `tokenizer._tokenizer.add_tokens()`** — not at fixed IDs. TokenizerWrapper (from `mlx_lm.load()`) lacks `add_tokens()` — must use the underlying HF tokenizer at `._tokenizer`. Always resolve at runtime via `tokenizer.convert_tokens_to_ids()`.
 
 6. **`forward_with_state()` removed** — replaced by KV cache persistent across turns. `agent.py` uses `mlx_lm.utils.generate_step()` with past cache.
 
@@ -83,6 +83,7 @@ These become single tokens at high IDs (>151936). Qwen's native tokens (`<|im_st
 ## Training infrastructure
 
 - **train.py**: `train_specialist()` (API for orchestrator, LoRA only, backbone frozen), `distill_backbone()` (unfreezes backbone, CE + KL)
+- **mx.compile**: Loss function compiled via `mx.compile(loss_fn)` — caches computation graph, reduces step time from ~4s to ~400ms (10x speedup). Compiled function re-traces automatically when input shapes change (seq_len schedule).
 - **training_utils.py**: Shared helpers — `GradientAccumulator`, `NaNRecovery`, `BatchLogger`, `compute_loss()`, `format_sample()`
 - **NaN recovery**: All training loops detect non-finite loss/gradients, rollback params + optimizer state, zero gradients, skip batch
 - **CosineWarmupScheduler** (`scheduler.py`): Linear warmup → cosine decay, `min_lr_ratio=0.1`
@@ -92,7 +93,7 @@ These become single tokens at high IDs (>151936). Qwen's native tokens (`<|im_st
 
 ## Router training (`router.py`)
 
-- Tiny classifier: `Linear(d_model=512 → 64) → ReLU → Linear(64 → n_domains)` (~65K params)
+- Tiny classifier: `Linear(d_model=896 → 64) → ReLU → Linear(64 → n_domains)` (~65K params)
 - Uses **last-position** hidden state from backbone (before lm_head)
 - Falls back to `"tool_caller"` when max softmax < 0.6
 - `router.train()` caches hidden states (one backbone forward per sample), then trains classifier
@@ -107,7 +108,7 @@ These become single tokens at high IDs (>151936). Qwen's native tokens (`<|im_st
 
 ## Model architecture
 
-- **Qwen2.5-0.5B**: 24 transformer layers, RoPE, SwiGLU FFN, 512 hidden dim, 14 heads, 151K vocab
+- **Qwen2.5-0.5B**: 24 transformer layers, RoPE, SwiGLU FFN, 896 hidden dim, 14 heads, 151K vocab
 - Loaded via `mlx_lm.load()` — no custom layers
 - KV cache for O(L) generation (no more SSM state)
 - **No MTP, no Mamba, no custom attention** — the old `model/` directory is deleted
@@ -140,4 +141,6 @@ mlx, mlx-lm, transformers, sentencepiece, datasets, orjson, msgspec, tqdm, numpy
 - Runs on 16GB MacBook Air. Qwen2.5-0.5B in fp16: ~900MB weights + ~100MB KV cache per 2K tokens.
 - Training peaks at ~3GB RAM (backbone frozen, LoRA only).
 - Swap thrashing observed with seq_len > 1024 or batch_size > 1.
-- Per-step timing: ~1s at seq=128, ~4s at seq=512 (backbone forward + LoRA backward).
+- Per-step timing: ~1s at seq=128, ~4s at seq=512 (backbone forward + LoRA backward). **With `mx.compile`**: ~200ms at seq=128, ~400ms at seq=256, ~1.6s at seq=512.
+- **Seq=256, grad_accum=8, mx.compile**: ~400ms/step (5000 tok/s throughput). 2000 steps in ~13 min.
+- Timing formula in train.py: `tok/s = seq_len * grad_accum * steps_since_last_log / elapsed` (steps_since matters — at step 0 it's 1, at step 100 it's 100).

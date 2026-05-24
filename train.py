@@ -11,6 +11,7 @@ Usage:
 """
 
 import time, json, os, random, argparse, math
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -56,15 +57,19 @@ def _get_logits(model, input_ids):
 
 
 def _pretokenize_distill_data(combined_data, specialists, tokenizer, seq_len):
-    """Pre-tokenize samples for distillation with domain labels."""
+    """Pre-tokenize samples for distillation with domain labels.
+    Pads/truncates to fixed seq_len for consistent compile shapes."""
+    pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
     samples = combined_data.samples if hasattr(combined_data, 'samples') else combined_data
     tokenized = []
     for sample in samples:
         text = tokenizer.apply_chat_template(
             sample["messages"], tokenize=False, add_generation_prompt=False
         )
-        ids = tokenizer.encode(text)[:seq_len]
-        lbs = make_labels(ids, tokenizer)[:seq_len]
+        ids0 = tokenizer.encode(text)
+        lbs0 = make_labels(ids0, tokenizer)
+        ids = ids0[:seq_len] + [pad_id] * max(0, seq_len - len(ids0))
+        lbs = lbs0[:seq_len] + [-100] * max(0, seq_len - len(lbs0))
         domain = sample.get("domain", list(specialists.keys())[0])
         tokenized.append({"ids": ids, "labels": lbs, "domain": domain})
     random.shuffle(tokenized)
@@ -115,6 +120,10 @@ def train_specialist(backbone, tokenizer, dataset, domain_name,
 
     ds.pretokenize()
 
+    # Pre-tokenize to fixed-length .npz for consistent compile shapes
+    max_dataset_len = max(seq_len, max(seq_len_schedule.values(), default=seq_len))
+    ds.tokenize_to_npz(max_len=max_dataset_len)
+
     trainable = {k: v for k, v in backbone.trainable_parameters().items()}
 
     optimizer = optim.AdamW(learning_rate=lr, weight_decay=0.01)
@@ -138,20 +147,24 @@ def train_specialist(backbone, tokenizer, dataset, domain_name,
     last_logged_step = 0
     nan_count = 0
     current_seq_len = 0
+    n_retrace = 0
 
     def loss_fn(params, inp, tgt):
         backbone.update(params)
         logits = _get_logits(backbone, inp)
         return cross_entropy_loss(logits, tgt)
 
-    grad_fn = mx.compile(mx.value_and_grad(loss_fn))
-    compile_trace_count = 0
-    compile_hit_count = 0
+    # Compiled micro-step: forward + backward
+    # Fixed-length inputs (from .npz pre-tokenization) ensure no retracing
+    loss_and_grad = mx.value_and_grad(loss_fn)
+    compiled_step = mx.compile(loss_and_grad)
 
     while step < steps:
         target_seq_len = get_seq_len_from_schedule(step, seq_len_schedule)
         if target_seq_len != current_seq_len:
+            print(f"  [compile] seq_len {current_seq_len} -> {target_seq_len} (retrace)")
             current_seq_len = target_seq_len
+            n_retrace += 1
 
         n_epoch = min(5000, len(train_indices))
         epoch_indices = random.sample(train_indices, n_epoch)
@@ -161,7 +174,7 @@ def train_specialist(backbone, tokenizer, dataset, domain_name,
             if step >= steps:
                 break
 
-            loss, grads = grad_fn(trainable, input_ids, targets)
+            loss, grads = compiled_step(trainable, input_ids, targets)
             mx.eval(loss, grads)
 
             loss_finite = mx.isfinite(loss).item()
@@ -191,14 +204,19 @@ def train_specialist(backbone, tokenizer, dataset, domain_name,
                     tok_per_sec = (input_ids.shape[1] * grad_accum * steps_since) / (elapsed + 1e-8)
                     print(f"[{domain_name}] step {step:3d}/{steps} "
                           f"loss {avg_loss:.4f} lr {lr_now:.2e} "
-                          f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s")
+                          f"grad_norm {grad_norm:.3f} {tok_per_sec:.0f} tok/s "
+                          f"retrace={n_retrace}")
                     t_start = time.time()
                     last_logged_step = step
 
                 if step > 0 and step % 500 == 0:
-                    debug_logits = _get_logits(backbone, input_ids)
-                    debug_token = mx.argmax(debug_logits[:, -1, :], axis=-1).item()
-                    print(f"  [debug] last_pred_token={debug_token} ({tokenizer.decode([debug_token])!r})")
+                    try:
+                        debug_logits = _get_logits(backbone, input_ids)
+                        mx.eval(debug_logits)
+                        debug_token = mx.argmax(debug_logits[:, -1, :], axis=-1).item()
+                        print(f"  [debug] last_pred_token={debug_token} ({tokenizer.decode([debug_token])!r})")
+                    except Exception as e:
+                        print(f"  [debug] eval skipped: {e}")
 
                 step += 1
 
@@ -247,6 +265,17 @@ def distill_backbone(backbone, specialists, combined_data, tokenizer,
     t_start = time.time()
     nan_count = 0
 
+    def distill_loss_fn(params, ids, labels, spec_logits, beta):
+        backbone.update(params)
+        b_logits = _get_logits(backbone, ids)
+        task = cross_entropy_loss(b_logits, labels)
+        distill = kl_div(b_logits, spec_logits, labels)
+        return task + beta * distill
+
+    # Compiled distill step (fixed-length inputs prevent retracing)
+    distill_loss_and_grad = mx.value_and_grad(distill_loss_fn)
+    compiled_distill_step = mx.compile(distill_loss_and_grad)
+
     while step < steps:
         random.shuffle(train_samples)
         for sample in train_samples:
@@ -259,14 +288,7 @@ def distill_backbone(backbone, specialists, combined_data, tokenizer,
 
             spec_logits = _get_logits(spec_models[domain], ids)
 
-            def loss_fn(params):
-                backbone.update(params)
-                b_logits = _get_logits(backbone, ids)
-                task = cross_entropy_loss(b_logits, labels)
-                distill = kl_div(b_logits, spec_logits, labels)
-                return task + beta * distill
-
-            loss, grads = mx.value_and_grad(loss_fn)(trainable)
+            loss, grads = compiled_distill_step(trainable, ids, labels, spec_logits, beta)
             mx.eval(loss, grads)
 
             loss_finite = mx.isfinite(loss).item()

@@ -17,7 +17,7 @@ from mlx.utils import tree_flatten
 
 from config import APPRENTICE_ROUNDS
 from data.pipeline import AgentDataset
-from lora import apply_lora, save_adapter, reset_adapter, load_adapter
+from lora import apply_lora, save_adapter, reset_adapter, load_adapter, quantize_frozen_backbone
 from train import train_specialist, distill_backbone
 from router import TaskRouter
 
@@ -158,6 +158,8 @@ def main():
                         help="Only run distillation on existing adapters, skip specialist training")
     parser.add_argument("--train-router", action="store_true", default=False,
                         help="Train the task router on cached hidden states")
+    parser.add_argument("--no-quantize", action="store_true", default=False,
+                        help="Skip 4-bit quantization of frozen backbone")
     args = parser.parse_args()
 
     t_start = time.time()
@@ -182,6 +184,15 @@ def main():
     model = apply_lora(model)
     print(f"Model initialized. Trainable params: "
           f"{sum(p.size for _,p in tree_flatten(model.trainable_parameters())):,}")
+
+    # Quantize frozen backbone (4-bit) — speeds up forward pass
+    if not args.no_quantize:
+        try:
+            model = quantize_frozen_backbone(model, group_size=64, bits=4)
+        except Exception as e:
+            print(f"[warn] Quantization failed ({e}), continuing in fp16")
+    else:
+        print("[quantize] Skipped (--no-quantize)")
 
     if args.train_router:
         train_router(model, tokenizer, save_dir)

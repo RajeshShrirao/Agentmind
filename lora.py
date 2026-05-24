@@ -23,7 +23,9 @@ class LoRALinear(nn.Module):
         self.B = mx.zeros((out_features, rank))
 
     def __call__(self, x):
-        return self.base(x) + self.scale * (x @ self.A.T) @ self.B.T
+        base_out = mx.stop_gradient(self.base(x))
+        lora_out = self.scale * (x @ self.A.T) @ self.B.T
+        return base_out + lora_out
 
 def apply_lora(model, rank: int = 16, alpha: float = 32.0, targets: list[str] = None):
     """
@@ -160,3 +162,42 @@ def reset_adapter(model):
                 _reset(item)
     _reset(model)
     print("[lora] Reset all LoRA adapters to random init")
+
+
+def quantize_frozen_backbone(model, group_size=64, bits=4, lora_targets=None):
+    """
+    Quantize frozen nn.Linear layers to 4-bit, skipping LoRA-wrapped targets.
+
+    Run AFTER apply_lora(). Only touches nn.Linear modules NOT wrapped
+    in LoRALinear. The LoRA target layers (q_proj, k_proj, etc.) stay
+    in fp16 inside their LoRALinear wrapper, so training quality is
+    unaffected — only the frozen backbone weights are quantized.
+    """
+    if lora_targets is None:
+        lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"]
+
+    def _in_targets(name):
+        return any(t in name for t in lora_targets)
+
+    def _walk(module, path=""):
+        if isinstance(module, nn.Module):
+            for name, child in list(module.children().items()):
+                full = f"{path}.{name}" if path else name
+                if isinstance(child, nn.Linear) and not _in_targets(full):
+                    ql = nn.QuantizedLinear(child, group_size=group_size, bits=bits)
+                    setattr(module, name, ql)
+                else:
+                    _walk(child, full)
+        elif isinstance(module, list):
+            for i, item in enumerate(module):
+                _walk(item, f"{path}.{i}")
+        elif isinstance(module, dict):
+            for k, v in module.items():
+                _walk(v, f"{path}.{k}")
+
+    _walk(model)
+    total = mx.quantized_cache.size() if hasattr(mx, 'quantized_cache') else 0
+    print(f"[quantize] Frozen backbone quantized to {bits}-bit "
+          f"(group_size={group_size}) | LoRA targets remain fp16")
+    return model

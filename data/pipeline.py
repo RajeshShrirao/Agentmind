@@ -30,11 +30,21 @@ def make_labels(ids: list[int], tokenizer) -> list[int]:
 
 
 class AgentDataset:
-    def __init__(self, samples=None, tokenizer=None):
+    def __init__(self, samples=None, tokenizer=None, npz_path=None):
         self.samples = samples or []
         self.tokenizer = tokenizer
         self._cache = {}
         self._tokenized_samples = None
+        self._np_ids = None
+        self._np_labels = None
+        if npz_path:
+            self._load_npz(npz_path)
+
+    def _load_npz(self, path):
+        data = np.load(path)
+        self._np_ids = data["ids"]
+        self._np_labels = data["labels"]
+        print(f"  Loaded {len(self._np_ids)} pre-tokenized samples from {path}")
 
     @classmethod
     def from_raw(cls, path, tokenizer, pretokenize: bool = True):
@@ -76,6 +86,27 @@ class AgentDataset:
         self._cache = {i: sample for i, sample in enumerate(tokenized)}
         return self
 
+    def tokenize_to_npz(self, max_len=1024, output_path=None):
+        """Tokenize all samples to fixed-length numpy arrays (padded/truncated to max_len)."""
+        if self._tokenized_samples is None:
+            self.pretokenize()
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0)
+        if pad_id is None:
+            pad_id = 0
+        ids_list = []
+        labels_list = []
+        for ids, labels in self._tokenized_samples:
+            ids = ids[:max_len] + [pad_id] * max(0, max_len - len(ids))
+            labels = labels[:max_len] + [-100] * max(0, max_len - len(labels))
+            ids_list.append(ids)
+            labels_list.append(labels)
+        self._np_ids = np.array(ids_list, dtype=np.int32)
+        self._np_labels = np.array(labels_list, dtype=np.int32)
+        if output_path:
+            np.savez(output_path, ids=self._np_ids, labels=self._np_labels)
+            print(f"  Saved {len(self._np_ids)} pre-tokenized samples to {output_path}")
+        return self
+
     def train_val_split(self, ratio=0.95, shuffle=True):
         indices = list(range(len(self.samples)))
         if shuffle:
@@ -103,6 +134,8 @@ class AgentDataset:
         return len(self.samples)
 
     def __getitem__(self, idx):
+        if self._np_ids is not None:
+            return self._np_ids[idx], self._np_labels[idx]
         if self._tokenized_samples is not None:
             return self._tokenized_samples[idx]
         if idx in self._cache:
@@ -130,6 +163,18 @@ class AgentDataset:
 
 def collate_batch(samples: list, pad_id: int = 0, max_len: int = 2048) -> tuple:
     ids_list, labels_list = zip(*samples)
+
+    # Fast path: all arrays are pre-padded numpy, just need slicing and stacking
+    if isinstance(ids_list[0], np.ndarray):
+        n = len(ids_list)
+        ids_arr = np.empty((n, max_len), dtype=np.int32)
+        labels_arr = np.empty((n, max_len), dtype=np.int32)
+        for i in range(n):
+            ids_arr[i] = ids_list[i][:max_len]
+            labels_arr[i] = labels_list[i][:max_len]
+        return mx.array(ids_arr), mx.array(labels_arr)
+
+    # Fallback: variable-length Python lists, pad dynamically
     ids_padded = [x[:max_len] + [pad_id] * (max_len - min(len(x), max_len)) for x in ids_list]
     labels_padded = [x[:max_len] + [-100] * (max_len - min(len(x), max_len)) for x in labels_list]
     return mx.array(ids_padded), mx.array(labels_padded)
